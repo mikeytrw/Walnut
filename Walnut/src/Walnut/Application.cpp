@@ -42,6 +42,7 @@ static VkQueue                  g_Queue = VK_NULL_HANDLE;
 static VkDebugReportCallbackEXT g_DebugReport = VK_NULL_HANDLE;
 static VkPipelineCache          g_PipelineCache = VK_NULL_HANDLE;
 static VkDescriptorPool         g_DescriptorPool = VK_NULL_HANDLE;
+static bool                     g_RayTracingSupported = false;
 
 static ImGui_ImplVulkanH_Window g_MainWindowData;
 static int                      g_MinImageCount = 2;
@@ -62,6 +63,8 @@ void check_vk_result(VkResult err)
 	if (err == 0)
 		return;
 	fprintf(stderr, "[vulkan] Error: VkResult = %d\n", err);
+	fprintf(stderr, "[vulkan] Crashing. Press Enter to exit...\n");
+	getchar();
 	if (err < 0)
 		abort();
 }
@@ -81,8 +84,17 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 
 	// Create Vulkan Instance
 	{
+		VkApplicationInfo app_info = {};
+		app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+		app_info.pApplicationName = "RT2";
+		app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+		app_info.pEngineName = "RT2";
+		app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+		app_info.apiVersion = VK_API_VERSION_1_2;
+
 		VkInstanceCreateInfo create_info = {};
 		create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+		create_info.pApplicationInfo = &app_info;
 		create_info.enabledExtensionCount = extensions_count;
 		create_info.ppEnabledExtensionNames = extensions;
 #ifdef IMGUI_VULKAN_DEBUG_REPORT
@@ -171,20 +183,73 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 
 	// Create Logical Device (with 1 queue)
 	{
-		int device_extension_count = 1;
-		const char* device_extensions[] = { "VK_KHR_swapchain" };
+		const char* device_extensions[] = {
+			"VK_KHR_swapchain",
+			"VK_KHR_acceleration_structure",
+			"VK_KHR_ray_query",
+			"VK_KHR_buffer_device_address",
+			"VK_KHR_deferred_host_operations",
+			"VK_KHR_storage_buffer_storage_class",
+			"VK_KHR_spirv_1_4",
+			"VK_KHR_shader_float_controls",
+			"VK_KHR_shader_non_semantic_info"
+		};
+		int device_extension_count = IM_ARRAYSIZE(device_extensions);
+
+		// Query RT feature support
+		VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features = {};
+		buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+
+		VkPhysicalDeviceAccelerationStructureFeaturesKHR accel_features = {};
+		accel_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+		accel_features.pNext = &buffer_device_address_features;
+
+		VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
+		ray_query_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+		ray_query_features.pNext = &accel_features;
+
+		VkPhysicalDeviceFeatures2 device_features2 = {};
+		device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+		device_features2.pNext = &ray_query_features;
+
+		vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features2);
+
+		bool rt_supported = buffer_device_address_features.bufferDeviceAddress == VK_TRUE &&
+		                    accel_features.accelerationStructure == VK_TRUE &&
+		                    ray_query_features.rayQuery == VK_TRUE;
+
+		g_RayTracingSupported = rt_supported;
+
 		const float queue_priority[] = { 1.0f };
 		VkDeviceQueueCreateInfo queue_info[1] = {};
 		queue_info[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 		queue_info[0].queueFamilyIndex = g_QueueFamily;
 		queue_info[0].queueCount = 1;
 		queue_info[0].pQueuePriorities = queue_priority;
+
 		VkDeviceCreateInfo create_info = {};
 		create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		create_info.queueCreateInfoCount = sizeof(queue_info) / sizeof(queue_info[0]);
 		create_info.pQueueCreateInfos = queue_info;
 		create_info.enabledExtensionCount = device_extension_count;
 		create_info.ppEnabledExtensionNames = device_extensions;
+
+		if (rt_supported)
+		{
+			// Enable the features we queried
+			buffer_device_address_features.bufferDeviceAddress = VK_TRUE;
+			accel_features.accelerationStructure = VK_TRUE;
+			ray_query_features.rayQuery = VK_TRUE;
+			create_info.pNext = &device_features2;
+			std::cerr << "[RT2] Vulkan Ray Tracing extensions enabled.\n";
+		}
+		else
+		{
+			std::cerr << "[RT2] WARNING: Ray Tracing not supported on this device. Falling back to CPU renderer.\n";
+			// Fall back to just swapchain extension
+			create_info.enabledExtensionCount = 1;
+		}
+
 		err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
 		check_vk_result(err);
 		vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
@@ -204,7 +269,8 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 },
 			{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000 },
 			{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000 },
-			{ VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 }
+			{ VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000 },
+			{ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1000 }
 		};
 		VkDescriptorPoolCreateInfo pool_info = {};
 		pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -708,6 +774,26 @@ namespace Walnut {
 		return g_Device;
 	}
 
+	VkQueue Application::GetQueue()
+	{
+		return g_Queue;
+	}
+
+	uint32_t Application::GetQueueFamily()
+	{
+		return g_QueueFamily;
+	}
+
+	bool Application::IsRayTracingSupported()
+	{
+		return g_RayTracingSupported;
+	}
+
+	VkDescriptorPool Application::GetDescriptorPool()
+	{
+		return g_DescriptorPool;
+	}
+
 	VkCommandBuffer Application::GetCommandBuffer(bool begin)
 	{
 		ImGui_ImplVulkanH_Window* wd = &g_MainWindowData;
@@ -742,6 +828,7 @@ namespace Walnut {
 		end_info.commandBufferCount = 1;
 		end_info.pCommandBuffers = &commandBuffer;
 		auto err = vkEndCommandBuffer(commandBuffer);
+		if (err) fprintf(stderr, "[vulkan] vkEndCommandBuffer = %d\n", err);
 		check_vk_result(err);
 
 		// Create fence to ensure that the command buffer has finished executing
@@ -750,12 +837,15 @@ namespace Walnut {
 		fenceCreateInfo.flags = 0;
 		VkFence fence;
 		err = vkCreateFence(g_Device, &fenceCreateInfo, nullptr, &fence);
+		if (err) fprintf(stderr, "[vulkan] vkCreateFence = %d\n", err);
 		check_vk_result(err);
 
 		err = vkQueueSubmit(g_Queue, 1, &end_info, fence);
+		if (err) fprintf(stderr, "[vulkan] vkQueueSubmit = %d\n", err);
 		check_vk_result(err);
 
 		err = vkWaitForFences(g_Device, 1, &fence, VK_TRUE, DEFAULT_FENCE_TIMEOUT);
+		if (err) fprintf(stderr, "[vulkan] vkWaitForFences = %d\n", err);
 		check_vk_result(err);
 
 		vkDestroyFence(g_Device, fence, nullptr);

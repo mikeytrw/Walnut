@@ -51,6 +51,10 @@ namespace Walnut {
 		static VkInstance GetInstance();
 		static VkPhysicalDevice GetPhysicalDevice();
 		static VkDevice GetDevice();
+		static VkQueue GetQueue();
+		static uint32_t GetQueueFamily();
+		static bool IsRayTracingSupported();
+		static VkDescriptorPool GetDescriptorPool();
 
 		static VkCommandBuffer GetCommandBuffer(bool begin);
 		static void FlushCommandBuffer(VkCommandBuffer commandBuffer);
