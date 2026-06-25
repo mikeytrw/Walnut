@@ -54,6 +54,8 @@ namespace Walnut {
 		static VkQueue GetQueue();
 		static uint32_t GetQueueFamily();
 		static bool IsRayTracingSupported();
+		static bool IsRayTracingPipelineSupported();
+		static const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& GetRayTracingPipelineProperties();
 		static VkDescriptorPool GetDescriptorPool();
 
 		static VkCommandBuffer GetCommandBuffer(bool begin);

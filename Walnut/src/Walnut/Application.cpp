@@ -6,6 +6,7 @@
 
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_vulkan.h"
+#include "RTDispatch.h"
 #include <stdio.h>          // printf, fprintf
 #include <stdlib.h>         // abort
 #define GLFW_INCLUDE_NONE
@@ -43,6 +44,8 @@ static VkDebugReportCallbackEXT g_DebugReport = VK_NULL_HANDLE;
 static VkPipelineCache          g_PipelineCache = VK_NULL_HANDLE;
 static VkDescriptorPool         g_DescriptorPool = VK_NULL_HANDLE;
 static bool                     g_RayTracingSupported = false;
+static bool                     g_RayTracingPipelineSupported = false;
+static VkPhysicalDeviceRayTracingPipelinePropertiesKHR g_RTPipelineProperties = {};
 
 static ImGui_ImplVulkanH_Window g_MainWindowData;
 static int                      g_MinImageCount = 2;
@@ -187,6 +190,7 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			"VK_KHR_swapchain",
 			"VK_KHR_acceleration_structure",
 			"VK_KHR_ray_query",
+			"VK_KHR_ray_tracing_pipeline",
 			"VK_KHR_buffer_device_address",
 			"VK_KHR_deferred_host_operations",
 			"VK_KHR_storage_buffer_storage_class",
@@ -208,9 +212,13 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		ray_query_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
 		ray_query_features.pNext = &accel_features;
 
+		VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt_pipeline_features = {};
+		rt_pipeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+		rt_pipeline_features.pNext = &ray_query_features;
+
 		VkPhysicalDeviceFeatures2 device_features2 = {};
 		device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-		device_features2.pNext = &ray_query_features;
+		device_features2.pNext = &rt_pipeline_features;
 
 		vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features2);
 
@@ -218,7 +226,24 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		                    accel_features.accelerationStructure == VK_TRUE &&
 		                    ray_query_features.rayQuery == VK_TRUE;
 
+		bool rt_pipeline_supported = rt_supported &&
+		                              rt_pipeline_features.rayTracingPipeline == VK_TRUE;
+
 		g_RayTracingSupported = rt_supported;
+		g_RayTracingPipelineSupported = rt_pipeline_supported;
+
+		// Query RT pipeline properties (SBT alignment/handle size, max recursion depth)
+		g_RTPipelineProperties = {};
+		g_RTPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+		VkPhysicalDeviceProperties2 physical_device_properties2 = {};
+		physical_device_properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+		physical_device_properties2.pNext = &g_RTPipelineProperties;
+		vkGetPhysicalDeviceProperties2(g_PhysicalDevice, &physical_device_properties2);
+
+		std::cerr << "[RT2] RT props: maxRayRecursionDepth=" << g_RTPipelineProperties.maxRayRecursionDepth
+		          << " shaderGroupHandleSize=" << g_RTPipelineProperties.shaderGroupHandleSize
+		          << " baseAlignment=" << g_RTPipelineProperties.shaderGroupBaseAlignment
+		          << " handleAlignment=" << g_RTPipelineProperties.shaderGroupHandleAlignment << "\n";
 
 		const float queue_priority[] = { 1.0f };
 		VkDeviceQueueCreateInfo queue_info[1] = {};
@@ -240,8 +265,10 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			buffer_device_address_features.bufferDeviceAddress = VK_TRUE;
 			accel_features.accelerationStructure = VK_TRUE;
 			ray_query_features.rayQuery = VK_TRUE;
+			if (rt_pipeline_supported)
+				rt_pipeline_features.rayTracingPipeline = VK_TRUE;
 			create_info.pNext = &device_features2;
-			std::cerr << "[RT2] Vulkan Ray Tracing extensions enabled.\n";
+			std::cerr << "[RT2] Vulkan Ray Tracing extensions enabled (pipeline=" << (rt_pipeline_supported ? "yes" : "no") << ").\n";
 		}
 		else
 		{
@@ -253,6 +280,9 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
 		check_vk_result(err);
 		vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
+
+		// Cache RT entry points now that the device exists.
+		RTDispatchInit(g_Device);
 	}
 
 	// Create Descriptor Pool
@@ -787,6 +817,16 @@ namespace Walnut {
 	bool Application::IsRayTracingSupported()
 	{
 		return g_RayTracingSupported;
+	}
+
+	bool Application::IsRayTracingPipelineSupported()
+	{
+		return g_RayTracingPipelineSupported;
+	}
+
+	const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& Application::GetRayTracingPipelineProperties()
+	{
+		return g_RTPipelineProperties;
 	}
 
 	VkDescriptorPool Application::GetDescriptorPool()
