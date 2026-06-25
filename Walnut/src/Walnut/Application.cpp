@@ -196,7 +196,8 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			"VK_KHR_storage_buffer_storage_class",
 			"VK_KHR_spirv_1_4",
 			"VK_KHR_shader_float_controls",
-			"VK_KHR_shader_non_semantic_info"
+			"VK_KHR_shader_non_semantic_info",
+			"VK_EXT_descriptor_indexing"
 		};
 		int device_extension_count = IM_ARRAYSIZE(device_extensions);
 
@@ -216,9 +217,13 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		rt_pipeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
 		rt_pipeline_features.pNext = &ray_query_features;
 
+		VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptor_indexing_features = {};
+		descriptor_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+		descriptor_indexing_features.pNext = &rt_pipeline_features;
+
 		VkPhysicalDeviceFeatures2 device_features2 = {};
 		device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-		device_features2.pNext = &rt_pipeline_features;
+		device_features2.pNext = &descriptor_indexing_features;
 
 		vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features2);
 
@@ -267,6 +272,11 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			ray_query_features.rayQuery = VK_TRUE;
 			if (rt_pipeline_supported)
 				rt_pipeline_features.rayTracingPipeline = VK_TRUE;
+			// Enable descriptor indexing for bindless texture arrays
+			descriptor_indexing_features.descriptorBindingPartiallyBound = VK_TRUE;
+			descriptor_indexing_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
+			descriptor_indexing_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+			descriptor_indexing_features.runtimeDescriptorArray = VK_TRUE;
 			create_info.pNext = &device_features2;
 			std::cerr << "[RT2] Vulkan Ray Tracing extensions enabled (pipeline=" << (rt_pipeline_supported ? "yes" : "no") << ").\n";
 		}
