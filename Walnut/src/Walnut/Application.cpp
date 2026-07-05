@@ -197,7 +197,11 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			"VK_KHR_spirv_1_4",
 			"VK_KHR_shader_float_controls",
 			"VK_KHR_shader_non_semantic_info",
-			"VK_EXT_descriptor_indexing"
+			"VK_EXT_descriptor_indexing",
+			"VK_KHR_synchronization2",
+			"VK_KHR_create_renderpass2",
+			"VK_KHR_dynamic_rendering",
+			"VK_KHR_ray_tracing_maintenance1"
 		};
 		int device_extension_count = IM_ARRAYSIZE(device_extensions);
 
