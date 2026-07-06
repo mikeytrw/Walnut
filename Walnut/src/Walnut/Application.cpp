@@ -34,6 +34,9 @@ extern bool g_ApplicationRunning;
 #define IMGUI_VULKAN_DEBUG_REPORT
 #endif
 
+// Runtime validation override (set via ApplicationSpecification::EnableValidation)
+static bool g_EnableRuntimeValidation = false;
+
 static VkAllocationCallbacks* g_Allocator = NULL;
 static VkInstance               g_Instance = VK_NULL_HANDLE;
 static VkPhysicalDevice         g_PhysicalDevice = VK_NULL_HANDLE;
@@ -72,14 +75,12 @@ void check_vk_result(VkResult err)
 		abort();
 }
 
-#ifdef IMGUI_VULKAN_DEBUG_REPORT
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_report(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT objectType, uint64_t object, size_t location, int32_t messageCode, const char* pLayerPrefix, const char* pMessage, void* pUserData)
 {
 	(void)flags; (void)object; (void)location; (void)messageCode; (void)pUserData; (void)pLayerPrefix; // Unused arguments
 	fprintf(stderr, "[vulkan] Debug report from ObjectType: %i\nMessage: %s\n\n", objectType, pMessage);
 	return VK_FALSE;
 }
-#endif // IMGUI_VULKAN_DEBUG_REPORT
 
 static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 {
@@ -100,42 +101,52 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		create_info.pApplicationInfo = &app_info;
 		create_info.enabledExtensionCount = extensions_count;
 		create_info.ppEnabledExtensionNames = extensions;
+#if defined(IMGUI_VULKAN_DEBUG_REPORT) || 1
+		const bool useValidation = g_EnableRuntimeValidation
 #ifdef IMGUI_VULKAN_DEBUG_REPORT
-		// Enabling validation layers
-		const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
-		create_info.enabledLayerCount = 1;
-		create_info.ppEnabledLayerNames = layers;
-
-		// Enable debug report extension (we need additional storage, so we duplicate the user array to add our new extension to it)
-		const char** extensions_ext = (const char**)malloc(sizeof(const char*) * (extensions_count + 1));
-		memcpy(extensions_ext, extensions, extensions_count * sizeof(const char*));
-		extensions_ext[extensions_count] = "VK_EXT_debug_report";
-		create_info.enabledExtensionCount = extensions_count + 1;
-		create_info.ppEnabledExtensionNames = extensions_ext;
-
-		// Create Vulkan Instance
-		err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
-		check_vk_result(err);
-		free(extensions_ext);
-
-		// Get the function pointer (required for any extensions)
-		auto vkCreateDebugReportCallbackEXT = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkCreateDebugReportCallbackEXT");
-		IM_ASSERT(vkCreateDebugReportCallbackEXT != NULL);
-
-		// Setup the debug report callback
-		VkDebugReportCallbackCreateInfoEXT debug_report_ci = {};
-		debug_report_ci.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
-		debug_report_ci.flags = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT | VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT;
-		debug_report_ci.pfnCallback = debug_report;
-		debug_report_ci.pUserData = NULL;
-		err = vkCreateDebugReportCallbackEXT(g_Instance, &debug_report_ci, g_Allocator, &g_DebugReport);
-		check_vk_result(err);
-#else
-		// Create Vulkan Instance without any debug feature
-		err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
-		check_vk_result(err);
-		IM_UNUSED(g_DebugReport);
+			|| true
 #endif
+			;
+		if (useValidation)
+		{
+			// Enabling validation layers
+			const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
+			create_info.enabledLayerCount = 1;
+			create_info.ppEnabledLayerNames = layers;
+
+			// Enable debug report extension (we need additional storage, so we duplicate the user array to add our new extension to it)
+			const char** extensions_ext = (const char**)malloc(sizeof(const char*) * (extensions_count + 1));
+			memcpy(extensions_ext, extensions, extensions_count * sizeof(const char*));
+			extensions_ext[extensions_count] = "VK_EXT_debug_report";
+			create_info.enabledExtensionCount = extensions_count + 1;
+			create_info.ppEnabledExtensionNames = extensions_ext;
+
+			// Create Vulkan Instance
+			err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
+			check_vk_result(err);
+			free(extensions_ext);
+
+			// Get the function pointer (required for any extensions)
+			auto vkCreateDebugReportCallbackEXT = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkCreateDebugReportCallbackEXT");
+			IM_ASSERT(vkCreateDebugReportCallbackEXT != NULL);
+
+			// Setup the debug report callback
+			VkDebugReportCallbackCreateInfoEXT debug_report_ci = {};
+			debug_report_ci.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
+			debug_report_ci.flags = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT | VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT;
+			debug_report_ci.pfnCallback = debug_report;
+			debug_report_ci.pUserData = NULL;
+			err = vkCreateDebugReportCallbackEXT(g_Instance, &debug_report_ci, g_Allocator, &g_DebugReport);
+			check_vk_result(err);
+		}
+		else
+#endif
+		{
+			// Create Vulkan Instance without any debug feature
+			err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
+			check_vk_result(err);
+			IM_UNUSED(g_DebugReport);
+		}
 	}
 
 	// Select GPU
@@ -365,11 +376,15 @@ static void CleanupVulkan()
 {
 	vkDestroyDescriptorPool(g_Device, g_DescriptorPool, g_Allocator);
 
-#ifdef IMGUI_VULKAN_DEBUG_REPORT
-	// Remove the debug report callback
-	auto vkDestroyDebugReportCallbackEXT = (PFN_vkDestroyDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkDestroyDebugReportCallbackEXT");
-	vkDestroyDebugReportCallbackEXT(g_Instance, g_DebugReport, g_Allocator);
-#endif // IMGUI_VULKAN_DEBUG_REPORT
+#if defined(IMGUI_VULKAN_DEBUG_REPORT) || 1
+	if (g_DebugReport)
+	{
+		// Remove the debug report callback
+		auto vkDestroyDebugReportCallbackEXT = (PFN_vkDestroyDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkDestroyDebugReportCallbackEXT");
+		vkDestroyDebugReportCallbackEXT(g_Instance, g_DebugReport, g_Allocator);
+		g_DebugReport = VK_NULL_HANDLE;
+	}
+#endif
 
 	vkDestroyDevice(g_Device, g_Allocator);
 	vkDestroyInstance(g_Instance, g_Allocator);
@@ -516,6 +531,8 @@ namespace Walnut {
 
 	void Application::Init()
 	{
+		g_EnableRuntimeValidation = m_Specification.EnableValidation;
+
 		// Setup GLFW window
 		glfwSetErrorCallback(glfw_error_callback);
 		if (!glfwInit())
