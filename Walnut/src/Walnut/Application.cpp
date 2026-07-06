@@ -254,9 +254,13 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		dynamic_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
 		dynamic_rendering_features.pNext = &descriptor_indexing_features;
 
+		VkPhysicalDeviceVulkan11Features vulkan11_features = {};
+		vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+		vulkan11_features.pNext = &dynamic_rendering_features;
+
 		VkPhysicalDeviceFeatures2 device_features2 = {};
 		device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-		device_features2.pNext = &dynamic_rendering_features;
+		device_features2.pNext = &vulkan11_features;
 
 		vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features2);
 
@@ -311,6 +315,7 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			descriptor_indexing_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 			descriptor_indexing_features.runtimeDescriptorArray = VK_TRUE;
 			dynamic_rendering_features.dynamicRendering = VK_TRUE;
+			vulkan11_features.shaderDrawParameters = VK_TRUE;
 			create_info.pNext = &device_features2;
 			std::cerr << "[RT2] Vulkan Ray Tracing extensions enabled (pipeline=" << (rt_pipeline_supported ? "yes" : "no") << ").\n";
 		}
