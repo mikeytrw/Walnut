@@ -36,6 +36,7 @@ extern bool g_ApplicationRunning;
 
 // Runtime validation override (set via ApplicationSpecification::EnableValidation)
 static bool g_EnableRuntimeValidation = false;
+static bool g_EnableSyncValidation = false;
 
 static VkAllocationCallbacks* g_Allocator = NULL;
 static VkInstance               g_Instance = VK_NULL_HANDLE;
@@ -120,6 +121,19 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			extensions_ext[extensions_count] = "VK_EXT_debug_report";
 			create_info.enabledExtensionCount = extensions_count + 1;
 			create_info.ppEnabledExtensionNames = extensions_ext;
+
+			// Optional: sync validation via VkValidationFeaturesEXT
+			VkValidationFeaturesEXT validationFeatures = {};
+			VkValidationFeatureEnableEXT enabledFeatures[1] = {
+				VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
+			};
+			if (g_EnableSyncValidation)
+			{
+				validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+				validationFeatures.enabledValidationFeatureCount = 1;
+				validationFeatures.pEnabledValidationFeatures = enabledFeatures;
+				create_info.pNext = &validationFeatures;
+			}
 
 			// Create Vulkan Instance
 			err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
@@ -532,6 +546,7 @@ namespace Walnut {
 	void Application::Init()
 	{
 		g_EnableRuntimeValidation = m_Specification.EnableValidation;
+		g_EnableSyncValidation = m_Specification.EnableSyncValidation;
 
 		// Setup GLFW window
 		glfwSetErrorCallback(glfw_error_callback);
