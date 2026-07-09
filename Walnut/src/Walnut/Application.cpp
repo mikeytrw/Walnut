@@ -637,8 +637,18 @@ namespace Walnut {
 		// Load default font
 		ImFontConfig fontConfig;
 		fontConfig.FontDataOwnedByAtlas = false;
-		ImFont* robotoFont = io.Fonts->AddFontFromMemoryTTF((void*)g_RobotoRegular, sizeof(g_RobotoRegular), 20.0f, &fontConfig);
+		ImFont* robotoFont = io.Fonts->AddFontFromMemoryTTF((void*)g_RobotoRegular, sizeof(g_RobotoRegular), 16.0f, &fontConfig);
 		io.FontDefault = robotoFont;
+
+		// Tighten ImGui style for a more compact UI
+		ImGuiStyle& uiStyle = ImGui::GetStyle();
+		uiStyle.FramePadding = ImVec2(3.0f, 2.0f);
+		uiStyle.ItemSpacing = ImVec2(6.0f, 4.0f);
+		uiStyle.ItemInnerSpacing = ImVec2(4.0f, 3.0f);
+		uiStyle.WindowPadding = ImVec2(6.0f, 6.0f);
+		uiStyle.IndentSpacing = 14.0f;
+		uiStyle.GrabMinSize = 8.0f;
+		uiStyle.ScrollbarSize = 12.0f;
 
 		// Upload Fonts
 		{
