@@ -721,6 +721,10 @@ namespace Walnut {
 		ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 		ImGuiIO& io = ImGui::GetIO();
 
+		// Initialize frame timing baseline before the loop starts so the
+		// first frame's timestep is near-zero instead of the full app uptime.
+		m_LastFrameTime = GetTime();
+
 		// Main loop
 		while (!glfwWindowShouldClose(m_WindowHandle) && m_Running)
 		{
@@ -728,8 +732,19 @@ namespace Walnut {
 			// You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
 			// - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application.
 			// - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application.
-			// Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
+			// Generally you may always pass all inputs to dear imgui, and hide them from the application based on those two flags.
 			glfwPollEvents();
+
+			// Compute timestep at the start of the frame (before OnUpdate) so
+			// camera movement uses the actual elapsed time for this frame, not
+			// the previous frame's measured time. This eliminates 1 frame of
+			// input latency and keeps movement consistent under frame-time
+			// variance. Clamp to 250ms to avoid huge jumps after stalls (e.g.
+			// window drag, loading) without discarding normal frame variance.
+			float timeNow = GetTime();
+			m_FrameTime = timeNow - m_LastFrameTime;
+			m_LastFrameTime = timeNow;
+			m_TimeStep = glm::min<float>(m_FrameTime, 0.25f);
 
 			for (auto& layer : m_LayerStack)
 				layer->OnUpdate(m_TimeStep);
@@ -836,11 +851,6 @@ namespace Walnut {
 			// Present Main Platform Window
 			if (!main_is_minimized)
 				FramePresent(wd);
-
-			float time = GetTime();
-			m_FrameTime = time - m_LastFrameTime;
-			m_TimeStep = glm::min<float>(m_FrameTime, 0.0333f);
-			m_LastFrameTime = time;
 		}
 
 	}
