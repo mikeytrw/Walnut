@@ -226,7 +226,8 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			"VK_KHR_synchronization2",
 			"VK_KHR_create_renderpass2",
 			"VK_KHR_dynamic_rendering",
-			"VK_KHR_ray_tracing_maintenance1"
+			"VK_KHR_ray_tracing_maintenance1",
+			"VK_EXT_memory_budget"
 		};
 		int device_extension_count = IM_ARRAYSIZE(device_extensions);
 
