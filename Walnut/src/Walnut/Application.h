@@ -45,7 +45,17 @@ namespace Walnut {
 
 		void PushLayer(const std::shared_ptr<Layer>& layer) { m_LayerStack.emplace_back(layer); layer->OnAttach(); }
 
+		// Immediate, non-cancelable close. Used by headless completion and
+		// after the user has explicitly confirmed. Sets m_Running = false so
+		// the main loop exits at the next iteration.
 		void Close();
+
+		// Interactive, cancelable close request. Fires the close-request
+		// callback so the host layer can run an unsaved-changes prompt and
+		// cancel the close (e.g. user clicks Cancel). If no callback is
+		// set, this falls back to an immediate Close().
+		void RequestClose();
+		void SetCloseRequestCallback(const std::function<bool()>& cb) { m_CloseRequestCallback = cb; }
 
 		float GetTime();
 		GLFWwindow* GetWindowHandle() const { return m_WindowHandle; }
@@ -78,6 +88,7 @@ namespace Walnut {
 
 		std::vector<std::shared_ptr<Layer>> m_LayerStack;
 		std::function<void()> m_MenubarCallback;
+		std::function<bool()> m_CloseRequestCallback; // returns false to cancel
 	};
 
 	// Implemented by CLIENT

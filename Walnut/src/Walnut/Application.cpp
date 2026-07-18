@@ -570,6 +570,20 @@ namespace Walnut {
 		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 		m_WindowHandle = glfwCreateWindow(m_Specification.Width, m_Specification.Height, m_Specification.Name.c_str(), NULL, NULL);
 
+		// Route OS close (title-bar X / Alt+F4) through RequestClose so the
+		// host layer can run an unsaved-changes prompt and cancel the close.
+		// We cancel the GLFW close here and let the app drive m_Running via
+		// RequestClose(). Headless/internal completion still uses Close()
+		// directly and is unaffected.
+		glfwSetWindowCloseCallback(m_WindowHandle, [](GLFWwindow* w) {
+			Walnut::Application& app = Walnut::Application::Get();
+			// Always cancel the GLFW-level close; the app decides via
+			// RequestClose whether to set m_Running=false. If no callback is
+			// installed, RequestClose falls back to immediate Close().
+			app.RequestClose();
+			glfwSetWindowShouldClose(w, GLFW_FALSE);
+		});
+
 		// Setup Vulkan
 		if (!glfwVulkanSupported())
 		{
@@ -859,6 +873,24 @@ namespace Walnut {
 	void Application::Close()
 	{
 		m_Running = false;
+	}
+
+	void Application::RequestClose()
+	{
+		// If a close-request callback is installed, give the host a chance to
+		// cancel (e.g. unsaved-changes prompt). Returning false means "do not
+		// close"; the host is responsible for re-requesting once the user
+		// resolves the prompt. Returning true means proceed with close.
+		if (m_CloseRequestCallback)
+		{
+			if (m_CloseRequestCallback())
+				m_Running = false;
+			// else: cancelled; m_Running stays true.
+		}
+		else
+		{
+			m_Running = false;
+		}
 	}
 
 	float Application::GetTime()
