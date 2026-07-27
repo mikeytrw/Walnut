@@ -22,6 +22,10 @@ void RTDispatchInit(VkDevice device)
 	LOAD(CmdTraceRaysKHR);
 	LOAD(GetRayTracingShaderGroupHandlesKHR);
 
+	// VK_KHR_dynamic_rendering
+	LOAD(CmdBeginRenderingKHR);
+	LOAD(CmdEndRenderingKHR);
+
 #undef LOAD
 
 	g_RTDispatch = d;
