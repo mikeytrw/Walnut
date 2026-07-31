@@ -36,7 +36,9 @@ project "Walnut"
 
    filter "configurations:Debug"
       defines { "WL_DEBUG" }
-      runtime "Debug"
+      -- Must match RT2App's Debug CRT: Walnut is linked into RT2App, which
+      -- links prebuilt /MD NRD/NRI libraries. See RT2App/premake5.lua.
+      runtime "Release"
       symbols "On"
 
    filter "configurations:Release"

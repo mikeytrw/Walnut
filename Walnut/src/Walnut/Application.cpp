@@ -30,9 +30,23 @@ extern bool g_ApplicationRunning;
 #endif
 
 //#define IMGUI_UNLIMITED_FRAME_RATE
-#ifdef _DEBUG
-#define IMGUI_VULKAN_DEBUG_REPORT
-#endif
+
+// Validation layers are opt-in via --validate (ApplicationSpecification::
+// EnableValidation), never implied by the build configuration.
+//
+// This used to be `#ifdef _DEBUG`, which forced validation on for every Debug
+// run. Two reasons it is gone rather than re-expressed as WL_DEBUG:
+//
+// 1. Debug now builds against the release CRT so it can link the prebuilt
+//    /MD NRD/NRI libraries, so _DEBUG is no longer defined and the coupling
+//    would have broken silently -- Debug would have stopped enabling
+//    validation with nothing to say so.
+// 2. Tying a Vulkan diagnostic to the CRT choice was always the wrong seam.
+//    --validate is explicit, works in both configurations, and is the flag
+//    the headless gates already use.
+//
+// If you want validation, pass --validate. Defining IMGUI_VULKAN_DEBUG_REPORT
+// here still forces it on unconditionally, as before.
 
 // Runtime validation override (set via ApplicationSpecification::EnableValidation)
 static bool g_EnableRuntimeValidation = false;
