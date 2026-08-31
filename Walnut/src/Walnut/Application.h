@@ -72,6 +72,7 @@ namespace Walnut {
 		MissingExtension,
 		InstanceCreateFailure,
 		DeviceCreateFailure,
+	DiagnosticSinkFailure,
 	};
 
 	struct OptionalVulkanFeatureDiagnostic
@@ -85,6 +86,47 @@ namespace Walnut {
 	};
 
 	using OptionalVulkanFeatureDiagnosticSink = std::function<void(const OptionalVulkanFeatureDiagnostic&)>;
+
+	// Publication is part of the optional-feature boundary: a consumer sink is
+	// untrusted and must not unwind Vulkan setup after handles are installed.
+	inline void PublishOptionalVulkanDiagnostic(
+		std::vector<OptionalVulkanFeatureDiagnostic>& diagnostics,
+		OptionalVulkanFeatureDiagnostic diagnostic,
+		const OptionalVulkanFeatureDiagnosticSink& sink,
+		const std::function<void(const OptionalVulkanFeatureDiagnostic&)>& log)
+	{
+		diagnostics.emplace_back(std::move(diagnostic));
+		if (log)
+			log(diagnostics.back());
+		if (!sink)
+			return;
+		try
+		{
+			sink(diagnostics.back());
+		}
+		catch (const std::exception& exception)
+		{
+			OptionalVulkanFeatureDiagnostic sinkFailure;
+			sinkFailure.featureName = diagnostics.back().featureName;
+			sinkFailure.phase = OptionalVulkanFeatureRequirementPhase::Provider;
+			sinkFailure.reason = OptionalVulkanFeatureDisableReason::DiagnosticSinkFailure;
+			sinkFailure.message = std::string("optional Vulkan diagnostic sink threw an exception: ") + exception.what();
+			diagnostics.emplace_back(std::move(sinkFailure));
+			if (log)
+				log(diagnostics.back());
+		}
+		catch (...)
+		{
+			OptionalVulkanFeatureDiagnostic sinkFailure;
+			sinkFailure.featureName = diagnostics.back().featureName;
+			sinkFailure.phase = OptionalVulkanFeatureRequirementPhase::Provider;
+			sinkFailure.reason = OptionalVulkanFeatureDisableReason::DiagnosticSinkFailure;
+			sinkFailure.message = "optional Vulkan diagnostic sink threw an unknown exception";
+			diagnostics.emplace_back(std::move(sinkFailure));
+			if (log)
+				log(diagnostics.back());
+		}
+	}
 
 	// Pure selection helper used by the bootstrap and by CPU-only seam tests.
 	// It preserves request order, removes duplicates, and reports names that
@@ -119,6 +161,28 @@ namespace Walnut {
 		return selection;
 	}
 
+	// Preserve provider-owned device names even when a provider requirement
+	// overlaps a baseline extension.  Without optionalNames, the baseline RT
+	// fallback would silently drop a validated provider requirement.
+	inline std::vector<std::string> NormalizeVulkanDeviceExtensions(
+		const std::vector<std::string>& requested,
+		const std::vector<std::string>& baseline,
+		const std::vector<std::string>& optionalNames,
+		bool rayTracingSupported)
+	{
+		std::unordered_set<std::string> providerNames(optionalNames.begin(), optionalNames.end());
+		std::unordered_set<std::string> seen;
+		std::vector<std::string> normalized;
+		for (const std::string& name : requested)
+		{
+			if (!seen.emplace(name).second)
+				continue;
+			if (rayTracingSupported || (!baseline.empty() && name == baseline.front()) || providerNames.find(name) != providerNames.end())
+				normalized.emplace_back(name);
+		}
+		return normalized;
+	}
+
 	// Hook-parameterized bootstrap authority. Production supplies real Vulkan
 	// operations; focused tests supply fakes without a loader or physical GPU.
 	struct OptionalVulkanRequirementsHooks
@@ -126,7 +190,7 @@ namespace Walnut {
 			std::function<Result<std::vector<VkExtensionProperties>>()> enumerateInstanceExtensions;
 			std::function<Result<std::vector<VkExtensionProperties>>(VkInstance, VkPhysicalDevice)> enumerateDeviceExtensions;
 			std::function<VkResult(const std::vector<std::string>&, bool, VkInstance&)> createInstance;
-			std::function<VkResult(VkInstance, VkPhysicalDevice, const std::vector<std::string>&, bool, VkDevice&)> createDevice;
+			std::function<VkResult(VkInstance, VkPhysicalDevice, const std::vector<std::string>&, const std::vector<std::string>&, bool, VkDevice&)> createDevice;
 			std::function<VkPhysicalDevice(VkInstance)> selectPhysicalDevice;
 		};
 
@@ -139,6 +203,7 @@ namespace Walnut {
 			VkResult baselineDeviceCreateResult = VK_SUCCESS;
 			std::vector<std::string> instanceExtensions;
 			std::vector<std::string> deviceExtensions;
+			std::vector<std::string> optionalDeviceExtensions;
 			std::vector<std::string> events;
 			std::vector<OptionalVulkanFeatureDiagnostic> diagnostics;
 		};
@@ -311,6 +376,7 @@ namespace Walnut {
 						{
 							result.deviceExtensions.insert(result.deviceExtensions.end(), selection.enabled.begin(), selection.enabled.end());
 							deduplicate(result.deviceExtensions);
+							result.optionalDeviceExtensions = selection.enabled;
 							result.optionalFeatureEnabled = true;
 						}
 					}
@@ -321,16 +387,18 @@ namespace Walnut {
 			{
 				result.events.emplace_back(result.optionalFeatureEnabled ? "create-device-optional" : "create-device-baseline");
 				VkDevice device = VK_NULL_HANDLE;
-				VkResult createResult = hooks.createDevice(instance, physicalDevice, result.deviceExtensions, result.optionalFeatureEnabled, device);
+				VkResult createResult = hooks.createDevice(instance, physicalDevice, result.deviceExtensions,
+					result.optionalDeviceExtensions, result.optionalFeatureEnabled, device);
 				if (createResult != VK_SUCCESS && result.optionalFeatureEnabled)
 				{
 					result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
 						OptionalVulkanFeatureDisableReason::DeviceCreateFailure, {}, createResult,
 						"vkCreateDevice failed with optional requirements; baseline retry performed"});
 					result.optionalFeatureEnabled = false;
+					result.optionalDeviceExtensions.clear();
 					result.deviceExtensions = normalizedBaselineDeviceExtensions;
 					result.events.emplace_back("create-device-baseline-retry");
-					createResult = hooks.createDevice(instance, physicalDevice, result.deviceExtensions, false, device);
+					createResult = hooks.createDevice(instance, physicalDevice, result.deviceExtensions, {}, false, device);
 				}
 				if (createResult != VK_SUCCESS)
 				{

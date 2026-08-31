@@ -37,7 +37,7 @@ Walnut::OptionalVulkanRequirementsHooks BaseHooks(
 		instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1));
 		return VK_SUCCESS;
 	};
-	hooks.createDevice = [](VkInstance, VkPhysicalDevice, const std::vector<std::string>&, bool, VkDevice& device) {
+	hooks.createDevice = [](VkInstance, VkPhysicalDevice, const std::vector<std::string>&, const std::vector<std::string>&, bool, VkDevice& device) {
 		device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(3));
 		return VK_SUCCESS;
 	};
@@ -59,8 +59,10 @@ void TestOrderingLifetimeAndDedupe()
 		instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1));
 		return VK_SUCCESS;
 	};
-	hooks.createDevice = [&deviceSeen, &deviceOptional](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, bool optional, VkDevice& device) {
+	std::vector<std::string> optionalDeviceSeen;
+	hooks.createDevice = [&deviceSeen, &optionalDeviceSeen, &deviceOptional](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, const std::vector<std::string>& optionalNames, bool optional, VkDevice& device) {
 		deviceSeen = names;
+		optionalDeviceSeen = optionalNames;
 		deviceOptional = optional;
 		device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(3));
 		return VK_SUCCESS;
@@ -83,6 +85,7 @@ void TestOrderingLifetimeAndDedupe()
 	Require(instanceOptional && deviceOptional, "production hooks did not receive enabled optional phase");
 	Require(instanceSeen == std::vector<std::string>({ "VK_KHR_surface", "VK_EXT_optional_instance" }), "instance names were not copied/deduped");
 	Require(deviceSeen == std::vector<std::string>({ "VK_KHR_swapchain", "VK_EXT_optional_device" }), "device names were not copied/deduped");
+	Require(optionalDeviceSeen == std::vector<std::string>({ "VK_KHR_swapchain", "VK_EXT_optional_device" }), "provider device provenance was not retained");
 	Require(result.events.size() >= 7 && result.events[0] == "provider" && result.events[1] == "enumerate-instance" &&
 		result.events[2] == "create-instance-optional" && result.events[3] == "select-physical-device" &&
 		result.events[4] == "provider-device" && result.events[5] == "enumerate-device" &&
@@ -146,7 +149,7 @@ void TestDeviceCreateRetry()
 		{}, { Extension("VK_EXT_optional_device") });
 	int createCount = 0;
 	std::vector<bool> deviceOptional;
-	hooks.createDevice = [&createCount, &deviceOptional](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, bool optional, VkDevice& device) {
+	hooks.createDevice = [&createCount, &deviceOptional](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, const std::vector<std::string>&, bool optional, VkDevice& device) {
 		++createCount;
 		deviceOptional.push_back(optional);
 		if (names.size() == 2)
@@ -183,7 +186,7 @@ void TestNoProviderUnchanged()
 		instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1));
 		return VK_SUCCESS;
 	};
-	hooks.createDevice = [&deviceCount](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, bool, VkDevice& device) {
+	hooks.createDevice = [&deviceCount](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, const std::vector<std::string>&, bool, VkDevice& device) {
 		++deviceCount;
 		if (names != std::vector<std::string>({ "VK_KHR_swapchain" }))
 			return VK_ERROR_INITIALIZATION_FAILED;
@@ -193,6 +196,38 @@ void TestNoProviderUnchanged()
 	auto result = Walnut::RunOptionalVulkanRequirements({}, { "VK_KHR_surface", "VK_KHR_surface" }, { "VK_KHR_swapchain", "VK_KHR_swapchain" }, hooks);
 	Require(instanceCount == 1 && deviceCount == 1 && result.diagnostics.empty() && !result.optionalFeatureEnabled,
 		"no-provider startup behavior changed");
+}
+
+void TestRealHookOverlapNormalization()
+{
+	const std::vector<std::string> baseline = { "VK_KHR_swapchain", "VK_KHR_buffer_device_address", "VK_EXT_rt" };
+	const std::vector<std::string> requested = { "VK_KHR_swapchain", "VK_KHR_buffer_device_address", "VK_EXT_rt" };
+	const std::vector<std::string> providerOwned = { "VK_KHR_buffer_device_address" };
+	Require(Walnut::NormalizeVulkanDeviceExtensions(requested, baseline, providerOwned, false) ==
+		std::vector<std::string>({ "VK_KHR_swapchain", "VK_KHR_buffer_device_address" }),
+		"real-hook normalization dropped an overlapping provider extension");
+	Require(Walnut::NormalizeVulkanDeviceExtensions(requested, baseline, {}, false) ==
+		std::vector<std::string>({ "VK_KHR_swapchain" }),
+		"baseline RT fallback no longer filters unsupported extensions");
+}
+
+void TestThrowingDiagnosticSinkIsContained()
+{
+	std::vector<Walnut::OptionalVulkanFeatureDiagnostic> diagnostics;
+	std::vector<std::string> logged;
+	Walnut::PublishOptionalVulkanDiagnostic(
+		diagnostics,
+		{ "sink-feature", Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
+			Walnut::OptionalVulkanFeatureDisableReason::MissingExtension, { "VK_EXT_missing" }, VK_SUCCESS,
+			"optional extension unavailable" },
+		[](const Walnut::OptionalVulkanFeatureDiagnostic&) { throw std::runtime_error("sink fault"); },
+		[&logged](const Walnut::OptionalVulkanFeatureDiagnostic& diagnostic) { logged.push_back(diagnostic.message); });
+	Require(diagnostics.size() == 2 && diagnostics[0].reason == Walnut::OptionalVulkanFeatureDisableReason::MissingExtension &&
+		diagnostics[1].reason == Walnut::OptionalVulkanFeatureDisableReason::DiagnosticSinkFailure &&
+		diagnostics[1].message == "optional Vulkan diagnostic sink threw an exception: sink fault",
+		"throwing diagnostic sink was not contained and retained");
+	Require(logged.size() == 2 && logged[0] == "optional extension unavailable" && logged[1] == diagnostics[1].message,
+		"throwing diagnostic sink failure was not deterministically logged");
 }
 
 }
@@ -206,6 +241,8 @@ int main()
 		TestInstanceCreateRetry();
 		TestDeviceCreateRetry();
 		TestNoProviderUnchanged();
+		TestRealHookOverlapNormalization();
+		TestThrowingDiagnosticSinkIsContained();
 		std::cout << "Optional Vulkan requirements tests passed\n";
 		return 0;
 	}

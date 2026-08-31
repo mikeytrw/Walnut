@@ -106,12 +106,14 @@ static void PublishOptionalDiagnostic(
 	std::vector<Walnut::OptionalVulkanFeatureDiagnostic>& diagnostics,
 	Walnut::OptionalVulkanFeatureDiagnostic diagnostic)
 {
-	diagnostics.emplace_back(diagnostic);
-	if (specification.optionalVulkanFeatureDiagnosticSink)
-		specification.optionalVulkanFeatureDiagnosticSink(diagnostics.back());
-
-	std::cerr << "[Walnut] optional Vulkan feature '" << diagnostic.featureName
-		          << "' disabled: " << diagnostic.message << "\n";
+	Walnut::PublishOptionalVulkanDiagnostic(
+		diagnostics,
+		std::move(diagnostic),
+		specification.optionalVulkanFeatureDiagnosticSink,
+		[](const Walnut::OptionalVulkanFeatureDiagnostic& logged) {
+			std::cerr << "[Walnut] optional Vulkan feature '" << logged.featureName
+			          << "' disabled: " << logged.message << "\n";
+		});
 }
 
 static bool EnumerateInstanceExtensions(std::vector<VkExtensionProperties>& extensions, VkResult& result)
@@ -215,7 +217,12 @@ static VkPhysicalDevice SelectPhysicalDevice(VkInstance instance)
 	return gpus[use_gpu];
 }
 
-static VkResult CreateLogicalDevice(VkPhysicalDevice physicalDevice, const std::vector<std::string>& requestedNames, bool optional, VkDevice& device)
+static VkResult CreateLogicalDevice(
+	VkPhysicalDevice physicalDevice,
+	const std::vector<std::string>& requestedNames,
+	const std::vector<std::string>& optionalNames,
+	bool optional,
+	VkDevice& device)
 {
 	g_PhysicalDevice = physicalDevice;
 	const char* baselineNames[] = {
@@ -236,7 +243,7 @@ static VkResult CreateLogicalDevice(VkPhysicalDevice physicalDevice, const std::
 		"VK_KHR_ray_tracing_maintenance1",
 		"VK_EXT_memory_budget"
 	};
-	const std::unordered_set<std::string> baselineSet(std::begin(baselineNames), std::end(baselineNames));
+	const std::vector<std::string> baselineExtensionNames(std::begin(baselineNames), std::end(baselineNames));
 
 	uint32_t queue_count = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &queue_count, nullptr);
@@ -291,16 +298,8 @@ static VkResult CreateLogicalDevice(VkPhysicalDevice physicalDevice, const std::
 		          << " baseAlignment=" << g_RTPipelineProperties.shaderGroupBaseAlignment
 		          << " handleAlignment=" << g_RTPipelineProperties.shaderGroupHandleAlignment << "\n";
 
-	std::vector<std::string> enabledNames;
-	for (const std::string& name : requestedNames)
-		if (rt_supported || name == baselineNames[0] || (optional && baselineSet.find(name) == baselineSet.end()))
-			enabledNames.emplace_back(name);
-	std::vector<std::string> deduplicated;
-	std::unordered_set<std::string> seen;
-	for (const std::string& name : enabledNames)
-		if (seen.emplace(name).second)
-			deduplicated.emplace_back(name);
-	enabledNames = std::move(deduplicated);
+	const std::vector<std::string> enabledNames = Walnut::NormalizeVulkanDeviceExtensions(
+		requestedNames, baselineExtensionNames, optional && !optionalNames.empty() ? optionalNames : std::vector<std::string>{}, rt_supported);
 	std::vector<const char*> extensionPointers;
 	for (const std::string& name : enabledNames)
 		extensionPointers.emplace_back(name.c_str());
@@ -417,8 +416,9 @@ static void SetupVulkan(
 		g_PhysicalDevice = SelectPhysicalDevice(instance);
 		return g_PhysicalDevice;
 	};
-	hooks.createDevice = [](VkInstance, VkPhysicalDevice physicalDevice, const std::vector<std::string>& names, bool optional, VkDevice& device) {
-		const VkResult result = CreateLogicalDevice(physicalDevice, names, optional, device);
+	hooks.createDevice = [](VkInstance, VkPhysicalDevice physicalDevice, const std::vector<std::string>& names,
+		const std::vector<std::string>& optionalNames, bool optional, VkDevice& device) {
+		const VkResult result = CreateLogicalDevice(physicalDevice, names, optionalNames, optional, device);
 		g_Device = result == VK_SUCCESS ? device : VK_NULL_HANDLE;
 		return result;
 	};
