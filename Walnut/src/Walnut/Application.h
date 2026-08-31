@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <utility>
+#include <optional>
 
 #include "imgui.h"
 #include "vulkan/vulkan.h"
@@ -66,6 +67,8 @@ namespace Walnut {
 		ProviderFailure,
 		ExtensionEnumerationFailure,
 		MissingExtension,
+		InstanceCreateFailure,
+		DeviceCreateFailure,
 	};
 
 	struct OptionalVulkanFeatureDiagnostic
@@ -111,6 +114,191 @@ namespace Walnut {
 				selection.enabled.emplace_back(name);
 		}
 		return selection;
+	}
+
+	// Injectable CPU-only bootstrap seam.  Production uses the same ordering
+	// and fallback contract in SetupVulkan; this seam makes the contract
+	// permanently testable without a Vulkan loader or physical GPU.
+	namespace Testing {
+		struct OptionalVulkanRequirementsTestHooks
+		{
+			std::function<Result<std::vector<VkExtensionProperties>>()> enumerateInstanceExtensions;
+			std::function<Result<std::vector<VkExtensionProperties>>(VkInstance, VkPhysicalDevice)> enumerateDeviceExtensions;
+			std::function<VkResult(const std::vector<std::string>&, VkInstance&)> createInstance;
+			std::function<VkResult(VkInstance, VkPhysicalDevice, const std::vector<std::string>&, VkDevice&)> createDevice;
+			std::function<VkPhysicalDevice(VkInstance)> selectPhysicalDevice;
+		};
+
+		struct OptionalVulkanRequirementsTestResult
+		{
+			bool optionalFeatureEnabled = false;
+			bool baselineInstanceCreateFailed = false;
+			bool baselineDeviceCreateFailed = false;
+			std::vector<std::string> instanceExtensions;
+			std::vector<std::string> deviceExtensions;
+			std::vector<std::string> events;
+			std::vector<OptionalVulkanFeatureDiagnostic> diagnostics;
+		};
+
+		inline OptionalVulkanRequirementsTestResult RunOptionalVulkanRequirementsTestFlow(
+			const std::function<Result<OptionalVulkanFeatureRequirements>()>& provider,
+			const std::vector<std::string>& baselineInstanceExtensions,
+			const std::vector<std::string>& baselineDeviceExtensions,
+			const OptionalVulkanRequirementsTestHooks& hooks)
+		{
+			OptionalVulkanRequirementsTestResult result;
+			result.instanceExtensions = baselineInstanceExtensions;
+			result.deviceExtensions = baselineDeviceExtensions;
+			auto deduplicate = [](std::vector<std::string>& names) {
+				std::vector<std::string> unique;
+				unique.reserve(names.size());
+				std::unordered_set<std::string> seen;
+				for (const std::string& name : names)
+					if (seen.emplace(name).second)
+						unique.emplace_back(name);
+				names = std::move(unique);
+			};
+			std::optional<OptionalVulkanFeatureRequirements> requirements;
+			std::string featureName = "optional-vulkan-feature";
+			result.events.emplace_back("provider");
+			if (provider)
+			{
+				Result<OptionalVulkanFeatureRequirements> provided = provider();
+				if (provided)
+				{
+					requirements = std::move(provided.value);
+					if (!requirements->featureName.empty())
+						featureName = requirements->featureName;
+				}
+				else
+				{
+					result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::Provider,
+						OptionalVulkanFeatureDisableReason::ProviderFailure, {}, VK_SUCCESS,
+						provided.error.empty() ? "provider returned failure" : provided.error});
+				}
+			}
+
+			VkInstance instance = VK_NULL_HANDLE;
+			if (requirements && hooks.enumerateInstanceExtensions)
+			{
+				result.events.emplace_back("enumerate-instance");
+				Result<std::vector<VkExtensionProperties>> available = hooks.enumerateInstanceExtensions();
+				if (!available)
+				{
+					result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
+						OptionalVulkanFeatureDisableReason::ExtensionEnumerationFailure, {}, VK_SUCCESS,
+						available.error.empty() ? "instance extension enumeration failed" : available.error});
+					requirements.reset();
+				}
+				else
+				{
+					const OptionalVulkanExtensionSelection selection =
+						DeduplicateAndValidateVulkanExtensions(requirements->instanceExtensions, available.value);
+					if (!selection.missing.empty())
+					{
+						result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
+							OptionalVulkanFeatureDisableReason::MissingExtension, selection.missing, VK_SUCCESS,
+							"one or more optional instance extensions are unavailable"});
+						requirements.reset();
+					}
+					else
+					{
+						result.instanceExtensions.insert(result.instanceExtensions.end(), selection.enabled.begin(), selection.enabled.end());
+						deduplicate(result.instanceExtensions);
+					}
+				}
+			}
+
+			if (hooks.createInstance)
+			{
+				result.events.emplace_back(requirements ? "create-instance-optional" : "create-instance-baseline");
+				VkResult createResult = hooks.createInstance(result.instanceExtensions, instance);
+				if (createResult != VK_SUCCESS && requirements)
+				{
+					result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
+						OptionalVulkanFeatureDisableReason::InstanceCreateFailure, {}, createResult,
+						"vkCreateInstance failed with optional requirements; baseline retry performed"});
+					requirements.reset();
+					result.instanceExtensions = baselineInstanceExtensions;
+					result.events.emplace_back("create-instance-baseline-retry");
+					createResult = hooks.createInstance(result.instanceExtensions, instance);
+				}
+				if (createResult != VK_SUCCESS)
+					result.baselineInstanceCreateFailed = true;
+			}
+
+			VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+			if (!result.baselineInstanceCreateFailed && hooks.selectPhysicalDevice)
+			{
+				result.events.emplace_back("select-physical-device");
+				physicalDevice = hooks.selectPhysicalDevice(instance);
+			}
+
+			if (!result.baselineInstanceCreateFailed && requirements && hooks.enumerateDeviceExtensions)
+			{
+				result.events.emplace_back("provider-device");
+				Result<std::vector<std::string>> provided = requirements->deviceExtensions
+					? requirements->deviceExtensions(instance, physicalDevice)
+					: Result<std::vector<std::string>>::Success({});
+				if (!provided)
+				{
+					result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+						OptionalVulkanFeatureDisableReason::ProviderFailure, {}, VK_SUCCESS,
+						provided.error.empty() ? "device extension provider returned failure" : provided.error});
+					requirements.reset();
+				}
+				else
+				{
+					result.events.emplace_back("enumerate-device");
+					Result<std::vector<VkExtensionProperties>> available = hooks.enumerateDeviceExtensions(instance, physicalDevice);
+					if (!available)
+					{
+						result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+							OptionalVulkanFeatureDisableReason::ExtensionEnumerationFailure, {}, VK_SUCCESS,
+							available.error.empty() ? "device extension enumeration failed" : available.error});
+						requirements.reset();
+					}
+					else
+					{
+						const OptionalVulkanExtensionSelection selection =
+							DeduplicateAndValidateVulkanExtensions(provided.value, available.value);
+						if (!selection.missing.empty())
+						{
+							result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+								OptionalVulkanFeatureDisableReason::MissingExtension, selection.missing, VK_SUCCESS,
+								"one or more optional device extensions are unavailable"});
+							requirements.reset();
+						}
+						else
+						{
+							result.deviceExtensions.insert(result.deviceExtensions.end(), selection.enabled.begin(), selection.enabled.end());
+							deduplicate(result.deviceExtensions);
+							result.optionalFeatureEnabled = true;
+						}
+					}
+				}
+			}
+
+			if (!result.baselineInstanceCreateFailed && hooks.createDevice)
+			{
+				result.events.emplace_back(result.optionalFeatureEnabled ? "create-device-optional" : "create-device-baseline");
+				VkDevice device = VK_NULL_HANDLE;
+				VkResult createResult = hooks.createDevice(instance, physicalDevice, result.deviceExtensions, device);
+				if (createResult != VK_SUCCESS && result.optionalFeatureEnabled)
+				{
+					result.diagnostics.push_back({featureName, OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+						OptionalVulkanFeatureDisableReason::DeviceCreateFailure, {}, createResult,
+						"vkCreateDevice failed with optional requirements; baseline retry performed"});
+					result.optionalFeatureEnabled = false;
+					result.deviceExtensions = baselineDeviceExtensions;
+					result.events.emplace_back("create-device-baseline-retry");
+					createResult = hooks.createDevice(instance, physicalDevice, result.deviceExtensions, device);
+				}
+				if (createResult != VK_SUCCESS)
+					result.baselineDeviceCreateFailed = true;
+			}
+			return result;
+		}
 	}
 
 	struct ApplicationSpecification

@@ -204,11 +204,14 @@ static void SetupVulkan(
 		}
 	}
 
-	// GLFW owns its returned array.  Copy every name before adding optional
-	// requirements so no SDK/GLFW pointer can outlive its owner.
+	// GLFW owns its returned array. Copy required and optional names into
+	// separate application-owned storage so an optional create can be retried
+	// with exactly the baseline set.
+	std::vector<std::string> baselineInstanceExtensionStorage;
+	std::vector<std::string> optionalInstanceExtensionStorage;
 	for (uint32_t i = 0; i < extensions_count; ++i)
 		if (extensions && extensions[i])
-			instanceExtensionStorage.emplace_back(extensions[i]);
+			baselineInstanceExtensionStorage.emplace_back(extensions[i]);
 
 	if (optionalRequirements)
 	{
@@ -239,26 +242,23 @@ static void SetupVulkan(
 			}
 			else
 			{
-				instanceExtensionStorage.insert(instanceExtensionStorage.end(), selection.enabled.begin(), selection.enabled.end());
+				optionalInstanceExtensionStorage = selection.enabled;
 			}
 		}
 	}
 
-	// Required GLFW extensions remain enabled exactly as before; only duplicate
-	// names are removed at the Vulkan boundary.
-	{
+	auto deduplicateNames = [](std::vector<std::string>& names) {
 		std::vector<std::string> deduplicated;
-		deduplicated.reserve(instanceExtensionStorage.size());
+		deduplicated.reserve(names.size());
 		std::unordered_set<std::string> seen;
-		for (const std::string& name : instanceExtensionStorage)
+		for (const std::string& name : names)
 			if (seen.emplace(name).second)
 				deduplicated.emplace_back(name);
-		instanceExtensionStorage = std::move(deduplicated);
-	}
-	std::vector<const char*> instanceExtensionPointers;
-	instanceExtensionPointers.reserve(instanceExtensionStorage.size());
-	for (const std::string& name : instanceExtensionStorage)
-		instanceExtensionPointers.emplace_back(name.c_str());
+		names = std::move(deduplicated);
+	};
+	deduplicateNames(baselineInstanceExtensionStorage);
+	deduplicateNames(optionalInstanceExtensionStorage);
+	const bool optionalInstanceRequirementsActive = optionalRequirements.has_value();
 
 	// Create Vulkan Instance
 	{
@@ -270,38 +270,37 @@ static void SetupVulkan(
 		app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
 		app_info.apiVersion = VK_API_VERSION_1_2;
 
-		VkInstanceCreateInfo create_info = {};
-		create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-		create_info.pApplicationInfo = &app_info;
-		create_info.enabledExtensionCount = static_cast<uint32_t>(instanceExtensionPointers.size());
-		create_info.ppEnabledExtensionNames = instanceExtensionPointers.data();
 #if defined(IMGUI_VULKAN_DEBUG_REPORT) || 1
 		const bool useValidation = g_EnableRuntimeValidation
 #ifdef IMGUI_VULKAN_DEBUG_REPORT
 			|| true
 #endif
 			;
+		std::vector<std::string> instanceCreateStorage = baselineInstanceExtensionStorage;
+		if (optionalInstanceRequirementsActive)
+			instanceCreateStorage.insert(instanceCreateStorage.end(), optionalInstanceExtensionStorage.begin(), optionalInstanceExtensionStorage.end());
+		deduplicateNames(instanceCreateStorage);
+		if (useValidation && std::find(baselineInstanceExtensionStorage.begin(), baselineInstanceExtensionStorage.end(), "VK_EXT_debug_report") == baselineInstanceExtensionStorage.end())
+			baselineInstanceExtensionStorage.emplace_back("VK_EXT_debug_report");
 		if (useValidation)
 		{
-			// Enabling validation layers
-			const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
+			instanceCreateStorage = baselineInstanceExtensionStorage;
+			if (optionalInstanceRequirementsActive)
+				instanceCreateStorage.insert(instanceCreateStorage.end(), optionalInstanceExtensionStorage.begin(), optionalInstanceExtensionStorage.end());
+			deduplicateNames(instanceCreateStorage);
+		}
+
+		VkApplicationInfo* applicationInfo = &app_info;
+		VkInstanceCreateInfo create_info = {};
+		create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+		create_info.pApplicationInfo = applicationInfo;
+		const char* validationLayers[] = { "VK_LAYER_KHRONOS_validation" };
+		VkValidationFeaturesEXT validationFeatures = {};
+		VkValidationFeatureEnableEXT enabledFeatures[1] = { VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT };
+		if (useValidation)
+		{
 			create_info.enabledLayerCount = 1;
-			create_info.ppEnabledLayerNames = layers;
-
-			// Enable debug report extension (we need additional storage, so we duplicate the user array to add our new extension to it)
-			if (std::find(instanceExtensionStorage.begin(), instanceExtensionStorage.end(), "VK_EXT_debug_report") == instanceExtensionStorage.end())
-				instanceExtensionStorage.emplace_back("VK_EXT_debug_report");
-			instanceExtensionPointers.clear();
-			for (const std::string& name : instanceExtensionStorage)
-				instanceExtensionPointers.emplace_back(name.c_str());
-			create_info.enabledExtensionCount = static_cast<uint32_t>(instanceExtensionPointers.size());
-			create_info.ppEnabledExtensionNames = instanceExtensionPointers.data();
-
-			// Optional: sync validation via VkValidationFeaturesEXT
-			VkValidationFeaturesEXT validationFeatures = {};
-			VkValidationFeatureEnableEXT enabledFeatures[1] = {
-				VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
-			};
+			create_info.ppEnabledLayerNames = validationLayers;
 			if (g_EnableSyncValidation)
 			{
 				validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
@@ -309,10 +308,38 @@ static void SetupVulkan(
 				validationFeatures.pEnabledValidationFeatures = enabledFeatures;
 				create_info.pNext = &validationFeatures;
 			}
+		}
+		std::vector<const char*> instanceExtensionPointers;
+		auto createInstance = [&](const std::vector<std::string>& names) {
+			instanceExtensionPointers.clear();
+			instanceExtensionPointers.reserve(names.size());
+			for (const std::string& name : names)
+				instanceExtensionPointers.emplace_back(name.c_str());
+			create_info.enabledExtensionCount = static_cast<uint32_t>(instanceExtensionPointers.size());
+			create_info.ppEnabledExtensionNames = instanceExtensionPointers.data();
+			return vkCreateInstance(&create_info, g_Allocator, &g_Instance);
+		};
 
-			// Create Vulkan Instance
-			err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
-			check_vk_result(err);
+		err = createInstance(instanceCreateStorage);
+		if (err != VK_SUCCESS && optionalInstanceRequirementsActive)
+		{
+			PublishOptionalDiagnostic(specification, diagnostics, {
+				optionalFeatureName,
+				Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
+				Walnut::OptionalVulkanFeatureDisableReason::InstanceCreateFailure,
+				{}, err,
+				"vkCreateInstance failed with optional requirements; baseline retry performed"});
+			optionalRequirements.reset();
+			optionalFeatureEnabled = false;
+			instanceCreateStorage = baselineInstanceExtensionStorage;
+			g_Instance = VK_NULL_HANDLE;
+			err = createInstance(instanceCreateStorage);
+		}
+		check_vk_result(err);
+		instanceExtensionStorage = instanceCreateStorage;
+
+		if (useValidation)
+		{
 			// Get the function pointer (required for any extensions)
 			auto vkCreateDebugReportCallbackEXT = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkCreateDebugReportCallbackEXT");
 			IM_ASSERT(vkCreateDebugReportCallbackEXT != NULL);
@@ -327,14 +354,9 @@ static void SetupVulkan(
 			check_vk_result(err);
 		}
 		else
-#endif
-		{
-			// Create Vulkan Instance without any debug feature
-			err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
-			check_vk_result(err);
 			IM_UNUSED(g_DebugReport);
-		}
 	}
+#endif
 
 	// Select GPU
 	{
@@ -526,26 +548,19 @@ static void SetupVulkan(
 		bool rt_pipeline_supported = rt_supported &&
 		                              rt_pipeline_features.rayTracingPipeline == VK_TRUE;
 
-		// Copy the existing Walnut requirements first, then append only the
-		// provider names that passed enumeration.  This keeps the baseline device
-		// contract unchanged when no provider is supplied.
-		const std::unordered_set<std::string> optionalDeviceExtensionNames(
-			deviceExtensionStorage.begin(), deviceExtensionStorage.end());
-		deviceExtensionStorage.insert(deviceExtensionStorage.begin(),
-			device_extensions,
-			device_extensions + IM_ARRAYSIZE(device_extensions));
-		{
-			std::vector<std::string> deduplicated;
-			deduplicated.reserve(deviceExtensionStorage.size());
-			std::unordered_set<std::string> seen;
-			for (const std::string& name : deviceExtensionStorage)
-				if (seen.emplace(name).second)
-					deduplicated.emplace_back(name);
-			deviceExtensionStorage = std::move(deduplicated);
-		}
+		const bool optionalDeviceRequirementsActive = optionalFeatureEnabled;
+		const std::vector<std::string> optionalDeviceExtensionStorage = deviceExtensionStorage;
+		std::vector<std::string> baselineDeviceExtensionStorage(
+			device_extensions, device_extensions + IM_ARRAYSIZE(device_extensions));
+		if (!rt_supported)
+			baselineDeviceExtensionStorage.resize(1);
+		std::vector<std::string> deviceCreateStorage = baselineDeviceExtensionStorage;
+		if (optionalDeviceRequirementsActive)
+			deviceCreateStorage.insert(deviceCreateStorage.end(), optionalDeviceExtensionStorage.begin(), optionalDeviceExtensionStorage.end());
+		deduplicateNames(deviceCreateStorage);
 		std::vector<const char*> deviceExtensionPointers;
-		deviceExtensionPointers.reserve(deviceExtensionStorage.size());
-		for (const std::string& name : deviceExtensionStorage)
+		deviceExtensionPointers.reserve(deviceCreateStorage.size());
+		for (const std::string& name : deviceCreateStorage)
 			deviceExtensionPointers.emplace_back(name.c_str());
 		uint32_t device_extension_count = static_cast<uint32_t>(deviceExtensionPointers.size());
 
@@ -600,19 +615,30 @@ static void SetupVulkan(
 		else
 		{
 			std::cerr << "[RT2] WARNING: Ray Tracing not supported on this device. Falling back to CPU renderer.\n";
-			// Fall back to just swapchain plus any validated optional extensions.
-			deviceExtensionPointers.clear();
-			for (const std::string& name : deviceExtensionStorage)
-				if (name == device_extensions[0] ||
-					(optionalFeatureEnabled && optionalDeviceExtensionNames.find(name) != optionalDeviceExtensionNames.end()))
-					deviceExtensionPointers.emplace_back(name.c_str());
-			device_extension_count = static_cast<uint32_t>(deviceExtensionPointers.size());
-			create_info.enabledExtensionCount = device_extension_count;
-			create_info.ppEnabledExtensionNames = deviceExtensionPointers.data();
 		}
 
 		err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
+		if (err != VK_SUCCESS && optionalDeviceRequirementsActive)
+		{
+			PublishOptionalDiagnostic(specification, diagnostics, {
+				optionalFeatureName,
+				Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+				Walnut::OptionalVulkanFeatureDisableReason::DeviceCreateFailure,
+				{}, err,
+				"vkCreateDevice failed with optional requirements; baseline retry performed"});
+			optionalFeatureEnabled = false;
+			deviceCreateStorage = baselineDeviceExtensionStorage;
+			deviceExtensionPointers.clear();
+			for (const std::string& name : deviceCreateStorage)
+				deviceExtensionPointers.emplace_back(name.c_str());
+			device_extension_count = static_cast<uint32_t>(deviceExtensionPointers.size());
+			create_info.enabledExtensionCount = device_extension_count;
+			create_info.ppEnabledExtensionNames = deviceExtensionPointers.data();
+			g_Device = VK_NULL_HANDLE;
+			err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
+		}
 		check_vk_result(err);
+		deviceExtensionStorage = std::move(deviceCreateStorage);
 		vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
 
 		// Cache RT entry points now that the device exists.
