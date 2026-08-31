@@ -19,11 +19,11 @@ VkExtensionProperties Extension(const char* name)
 	return extension;
 }
 
-Walnut::Testing::OptionalVulkanRequirementsTestHooks BaseHooks(
+Walnut::OptionalVulkanRequirementsHooks BaseHooks(
 	std::vector<VkExtensionProperties> instanceAvailable,
 	std::vector<VkExtensionProperties> deviceAvailable)
 {
-	Walnut::Testing::OptionalVulkanRequirementsTestHooks hooks;
+	Walnut::OptionalVulkanRequirementsHooks hooks;
 	hooks.enumerateInstanceExtensions = [instanceAvailable = std::move(instanceAvailable)]() {
 		return Walnut::Result<std::vector<VkExtensionProperties>>::Success(instanceAvailable);
 	};
@@ -33,11 +33,11 @@ Walnut::Testing::OptionalVulkanRequirementsTestHooks BaseHooks(
 	hooks.selectPhysicalDevice = [](VkInstance) {
 		return reinterpret_cast<VkPhysicalDevice>(static_cast<uintptr_t>(2));
 	};
-	hooks.createInstance = [](const std::vector<std::string>&, VkInstance& instance) {
+	hooks.createInstance = [](const std::vector<std::string>&, bool, VkInstance& instance) {
 		instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1));
 		return VK_SUCCESS;
 	};
-	hooks.createDevice = [](VkInstance, VkPhysicalDevice, const std::vector<std::string>&, VkDevice& device) {
+	hooks.createDevice = [](VkInstance, VkPhysicalDevice, const std::vector<std::string>&, bool, VkDevice& device) {
 		device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(3));
 		return VK_SUCCESS;
 	};
@@ -46,23 +46,27 @@ Walnut::Testing::OptionalVulkanRequirementsTestHooks BaseHooks(
 
 void TestOrderingLifetimeAndDedupe()
 {
-	Walnut::Testing::OptionalVulkanRequirementsTestHooks hooks = BaseHooks(
+	Walnut::OptionalVulkanRequirementsHooks hooks = BaseHooks(
 		{ Extension("VK_KHR_surface"), Extension("VK_EXT_optional_instance") },
 		{ Extension("VK_KHR_swapchain"), Extension("VK_EXT_optional_device") });
 	std::vector<std::string> instanceSeen;
 	std::vector<std::string> deviceSeen;
-	hooks.createInstance = [&instanceSeen](const std::vector<std::string>& names, VkInstance& instance) {
+	bool instanceOptional = false;
+	bool deviceOptional = false;
+	hooks.createInstance = [&instanceSeen, &instanceOptional](const std::vector<std::string>& names, bool optional, VkInstance& instance) {
 		instanceSeen = names;
+		instanceOptional = optional;
 		instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1));
 		return VK_SUCCESS;
 	};
-	hooks.createDevice = [&deviceSeen](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, VkDevice& device) {
+	hooks.createDevice = [&deviceSeen, &deviceOptional](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, bool optional, VkDevice& device) {
 		deviceSeen = names;
+		deviceOptional = optional;
 		device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(3));
 		return VK_SUCCESS;
 	};
 
-	auto result = Walnut::Testing::RunOptionalVulkanRequirementsTestFlow(
+	auto result = Walnut::RunOptionalVulkanRequirements(
 		[] {
 			// These values are local to the provider and must be copied by the flow.
 			Walnut::OptionalVulkanFeatureRequirements requirements;
@@ -76,6 +80,7 @@ void TestOrderingLifetimeAndDedupe()
 		{ "VK_KHR_surface" }, { "VK_KHR_swapchain" }, hooks);
 
 	Require(result.optionalFeatureEnabled, "optional feature should remain enabled");
+	Require(instanceOptional && deviceOptional, "production hooks did not receive enabled optional phase");
 	Require(instanceSeen == std::vector<std::string>({ "VK_KHR_surface", "VK_EXT_optional_instance" }), "instance names were not copied/deduped");
 	Require(deviceSeen == std::vector<std::string>({ "VK_KHR_swapchain", "VK_EXT_optional_device" }), "device names were not copied/deduped");
 	Require(result.events.size() >= 7 && result.events[0] == "provider" && result.events[1] == "enumerate-instance" &&
@@ -86,8 +91,8 @@ void TestOrderingLifetimeAndDedupe()
 
 void TestMissingExtensionFallback()
 {
-	Walnut::Testing::OptionalVulkanRequirementsTestHooks hooks = BaseHooks({}, {});
-	auto result = Walnut::Testing::RunOptionalVulkanRequirementsTestFlow(
+	Walnut::OptionalVulkanRequirementsHooks hooks = BaseHooks({}, {});
+	auto result = Walnut::RunOptionalVulkanRequirements(
 		[] {
 			Walnut::OptionalVulkanFeatureRequirements requirements;
 			requirements.featureName = "missing-feature";
@@ -100,23 +105,27 @@ void TestMissingExtensionFallback()
 		{ "VK_KHR_surface" }, { "VK_KHR_swapchain" }, hooks);
 	Require(!result.optionalFeatureEnabled, "missing instance extension must disable feature");
 	Require(result.instanceExtensions == std::vector<std::string>({ "VK_KHR_surface" }), "missing instance fallback changed baseline");
-	Require(result.diagnostics.size() == 1 && result.diagnostics[0].reason == Walnut::OptionalVulkanFeatureDisableReason::MissingExtension,
+	Require(result.diagnostics.size() == 1 && result.diagnostics[0].reason == Walnut::OptionalVulkanFeatureDisableReason::MissingExtension &&
+		result.diagnostics[0].phase == Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions &&
+		result.diagnostics[0].unavailableExtensions == std::vector<std::string>({ "VK_EXT_missing_instance" }),
 		"missing extension diagnostic absent");
 }
 
 void TestInstanceCreateRetry()
 {
-	Walnut::Testing::OptionalVulkanRequirementsTestHooks hooks = BaseHooks(
+	Walnut::OptionalVulkanRequirementsHooks hooks = BaseHooks(
 		{ Extension("VK_EXT_optional_instance") }, {});
 	int createCount = 0;
-	hooks.createInstance = [&createCount](const std::vector<std::string>& names, VkInstance& instance) {
+	std::vector<bool> instanceOptional;
+	hooks.createInstance = [&createCount, &instanceOptional](const std::vector<std::string>& names, bool optional, VkInstance& instance) {
 		++createCount;
+		instanceOptional.push_back(optional);
 		if (names.size() == 2)
 			return VK_ERROR_INITIALIZATION_FAILED;
 		instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1));
 		return VK_SUCCESS;
 	};
-	auto result = Walnut::Testing::RunOptionalVulkanRequirementsTestFlow(
+	auto result = Walnut::RunOptionalVulkanRequirements(
 		[] {
 			Walnut::OptionalVulkanFeatureRequirements requirements;
 			requirements.instanceExtensions = { "VK_EXT_optional_instance" };
@@ -125,6 +134,7 @@ void TestInstanceCreateRetry()
 		{ "VK_KHR_surface" }, { "VK_KHR_swapchain" }, hooks);
 	Require(createCount == 2 && !result.baselineInstanceCreateFailed && !result.optionalFeatureEnabled,
 		"instance optional-create retry contract failed");
+	Require(instanceOptional == std::vector<bool>({ true, false }), "instance retry did not disable optional hook phase");
 	Require(result.diagnostics.size() == 1 && result.diagnostics[0].reason == Walnut::OptionalVulkanFeatureDisableReason::InstanceCreateFailure &&
 		result.diagnostics[0].vkResult == VK_ERROR_INITIALIZATION_FAILED,
 		"instance create failure diagnostic missing exact VkResult");
@@ -132,17 +142,19 @@ void TestInstanceCreateRetry()
 
 void TestDeviceCreateRetry()
 {
-	Walnut::Testing::OptionalVulkanRequirementsTestHooks hooks = BaseHooks(
+	Walnut::OptionalVulkanRequirementsHooks hooks = BaseHooks(
 		{}, { Extension("VK_EXT_optional_device") });
 	int createCount = 0;
-	hooks.createDevice = [&createCount](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, VkDevice& device) {
+	std::vector<bool> deviceOptional;
+	hooks.createDevice = [&createCount, &deviceOptional](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, bool optional, VkDevice& device) {
 		++createCount;
+		deviceOptional.push_back(optional);
 		if (names.size() == 2)
 			return VK_ERROR_FEATURE_NOT_PRESENT;
 		device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(3));
 		return VK_SUCCESS;
 	};
-	auto result = Walnut::Testing::RunOptionalVulkanRequirementsTestFlow(
+	auto result = Walnut::RunOptionalVulkanRequirements(
 		[] {
 			Walnut::OptionalVulkanFeatureRequirements requirements;
 			requirements.deviceExtensions = [](VkInstance, VkPhysicalDevice) {
@@ -153,6 +165,7 @@ void TestDeviceCreateRetry()
 		{ "VK_KHR_surface" }, { "VK_KHR_swapchain" }, hooks);
 	Require(createCount == 2 && !result.baselineDeviceCreateFailed && !result.optionalFeatureEnabled,
 		"device optional-create retry contract failed");
+	Require(deviceOptional == std::vector<bool>({ true, false }), "device retry did not disable optional hook phase");
 	Require(result.diagnostics.size() == 1 && result.diagnostics[0].reason == Walnut::OptionalVulkanFeatureDisableReason::DeviceCreateFailure &&
 		result.diagnostics[0].vkResult == VK_ERROR_FEATURE_NOT_PRESENT,
 		"device create failure diagnostic missing exact VkResult");
@@ -160,24 +173,24 @@ void TestDeviceCreateRetry()
 
 void TestNoProviderUnchanged()
 {
-	Walnut::Testing::OptionalVulkanRequirementsTestHooks hooks = BaseHooks({}, {});
+	Walnut::OptionalVulkanRequirementsHooks hooks = BaseHooks({}, {});
 	int instanceCount = 0;
 	int deviceCount = 0;
-	hooks.createInstance = [&instanceCount](const std::vector<std::string>& names, VkInstance& instance) {
+	hooks.createInstance = [&instanceCount](const std::vector<std::string>& names, bool, VkInstance& instance) {
 		++instanceCount;
 		if (names != std::vector<std::string>({ "VK_KHR_surface" }))
 			return VK_ERROR_INITIALIZATION_FAILED;
 		instance = reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1));
 		return VK_SUCCESS;
 	};
-	hooks.createDevice = [&deviceCount](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, VkDevice& device) {
+	hooks.createDevice = [&deviceCount](VkInstance, VkPhysicalDevice, const std::vector<std::string>& names, bool, VkDevice& device) {
 		++deviceCount;
 		if (names != std::vector<std::string>({ "VK_KHR_swapchain" }))
 			return VK_ERROR_INITIALIZATION_FAILED;
 		device = reinterpret_cast<VkDevice>(static_cast<uintptr_t>(3));
 		return VK_SUCCESS;
 	};
-	auto result = Walnut::Testing::RunOptionalVulkanRequirementsTestFlow({}, { "VK_KHR_surface" }, { "VK_KHR_swapchain" }, hooks);
+	auto result = Walnut::RunOptionalVulkanRequirements({}, { "VK_KHR_surface", "VK_KHR_surface" }, { "VK_KHR_swapchain", "VK_KHR_swapchain" }, hooks);
 	Require(instanceCount == 1 && deviceCount == 1 && result.diagnostics.empty() && !result.optionalFeatureEnabled,
 		"no-provider startup behavior changed");
 }

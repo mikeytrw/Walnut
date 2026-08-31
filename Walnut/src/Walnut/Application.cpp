@@ -19,6 +19,7 @@
 #include <exception>
 #include <optional>
 #include <unordered_set>
+#include <iterator>
 
 // Emedded font
 #include "ImGui/Roboto-Regular.embed"
@@ -147,6 +148,204 @@ static bool EnumerateDeviceExtensions(VkPhysicalDevice physicalDevice, std::vect
 	return true;
 }
 
+static VkResult CreateVulkanInstance(const std::vector<std::string>& names, bool, VkInstance& instance)
+{
+	VkApplicationInfo app_info = {};
+	app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+	app_info.pApplicationName = "RT2";
+	app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+	app_info.pEngineName = "RT2";
+	app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+	app_info.apiVersion = VK_API_VERSION_1_2;
+
+	std::vector<const char*> pointers;
+	pointers.reserve(names.size());
+	for (const std::string& name : names)
+		pointers.emplace_back(name.c_str());
+
+	VkInstanceCreateInfo create_info = {};
+	create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+	create_info.pApplicationInfo = &app_info;
+	create_info.enabledExtensionCount = static_cast<uint32_t>(pointers.size());
+	create_info.ppEnabledExtensionNames = pointers.data();
+	const bool useValidation = g_EnableRuntimeValidation
+#ifdef IMGUI_VULKAN_DEBUG_REPORT
+		|| true
+#endif
+		;
+	const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
+	VkValidationFeaturesEXT validationFeatures = {};
+	VkValidationFeatureEnableEXT enabledFeatures[1] = { VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT };
+	if (useValidation)
+	{
+		create_info.enabledLayerCount = 1;
+		create_info.ppEnabledLayerNames = layers;
+		if (g_EnableSyncValidation)
+		{
+			validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+			validationFeatures.enabledValidationFeatureCount = 1;
+			validationFeatures.pEnabledValidationFeatures = enabledFeatures;
+			create_info.pNext = &validationFeatures;
+		}
+	}
+	return vkCreateInstance(&create_info, g_Allocator, &instance);
+}
+
+static VkPhysicalDevice SelectPhysicalDevice(VkInstance instance)
+{
+	VkResult err;
+	uint32_t gpu_count = 0;
+	err = vkEnumeratePhysicalDevices(instance, &gpu_count, nullptr);
+	check_vk_result(err);
+	IM_ASSERT(gpu_count > 0);
+	std::vector<VkPhysicalDevice> gpus(gpu_count);
+	err = vkEnumeratePhysicalDevices(instance, &gpu_count, gpus.data());
+	check_vk_result(err);
+	int use_gpu = 0;
+	for (int i = 0; i < static_cast<int>(gpu_count); ++i)
+	{
+		VkPhysicalDeviceProperties properties;
+		vkGetPhysicalDeviceProperties(gpus[i], &properties);
+		if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+		{
+			use_gpu = i;
+			break;
+		}
+	}
+	return gpus[use_gpu];
+}
+
+static VkResult CreateLogicalDevice(VkPhysicalDevice physicalDevice, const std::vector<std::string>& requestedNames, bool optional, VkDevice& device)
+{
+	g_PhysicalDevice = physicalDevice;
+	const char* baselineNames[] = {
+		"VK_KHR_swapchain",
+		"VK_KHR_acceleration_structure",
+		"VK_KHR_ray_query",
+		"VK_KHR_ray_tracing_pipeline",
+		"VK_KHR_buffer_device_address",
+		"VK_KHR_deferred_host_operations",
+		"VK_KHR_storage_buffer_storage_class",
+		"VK_KHR_spirv_1_4",
+		"VK_KHR_shader_float_controls",
+		"VK_KHR_shader_non_semantic_info",
+		"VK_EXT_descriptor_indexing",
+		"VK_KHR_synchronization2",
+		"VK_KHR_create_renderpass2",
+		"VK_KHR_dynamic_rendering",
+		"VK_KHR_ray_tracing_maintenance1",
+		"VK_EXT_memory_budget"
+	};
+	const std::unordered_set<std::string> baselineSet(std::begin(baselineNames), std::end(baselineNames));
+
+	uint32_t queue_count = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &queue_count, nullptr);
+	std::vector<VkQueueFamilyProperties> queues(queue_count);
+	vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &queue_count, queues.data());
+	for (uint32_t i = 0; i < queue_count; ++i)
+		if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+		{
+			g_QueueFamily = i;
+			break;
+		}
+	IM_ASSERT(g_QueueFamily != (uint32_t)-1);
+
+	VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features = {};
+	buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+	VkPhysicalDeviceAccelerationStructureFeaturesKHR accel_features = {};
+	accel_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+	accel_features.pNext = &buffer_device_address_features;
+	VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
+	ray_query_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+	ray_query_features.pNext = &accel_features;
+	VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt_pipeline_features = {};
+	rt_pipeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+	rt_pipeline_features.pNext = &ray_query_features;
+	VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptor_indexing_features = {};
+	descriptor_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
+	descriptor_indexing_features.pNext = &rt_pipeline_features;
+	VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering_features = {};
+	dynamic_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
+	dynamic_rendering_features.pNext = &descriptor_indexing_features;
+	VkPhysicalDeviceVulkan11Features vulkan11_features = {};
+	vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+	vulkan11_features.pNext = &dynamic_rendering_features;
+	VkPhysicalDeviceFeatures2 device_features2 = {};
+	device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+	device_features2.pNext = &vulkan11_features;
+	vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features2);
+	const bool rt_supported = buffer_device_address_features.bufferDeviceAddress == VK_TRUE &&
+		accel_features.accelerationStructure == VK_TRUE && ray_query_features.rayQuery == VK_TRUE;
+	const bool rt_pipeline_supported = rt_supported && rt_pipeline_features.rayTracingPipeline == VK_TRUE;
+	g_RayTracingSupported = rt_supported;
+	g_RayTracingPipelineSupported = rt_pipeline_supported;
+
+	g_RTPipelineProperties = {};
+	g_RTPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+	VkPhysicalDeviceProperties2 physical_device_properties2 = {};
+	physical_device_properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+	physical_device_properties2.pNext = &g_RTPipelineProperties;
+	vkGetPhysicalDeviceProperties2(g_PhysicalDevice, &physical_device_properties2);
+	std::cerr << "[RT2] RT props: maxRayRecursionDepth=" << g_RTPipelineProperties.maxRayRecursionDepth
+		          << " shaderGroupHandleSize=" << g_RTPipelineProperties.shaderGroupHandleSize
+		          << " baseAlignment=" << g_RTPipelineProperties.shaderGroupBaseAlignment
+		          << " handleAlignment=" << g_RTPipelineProperties.shaderGroupHandleAlignment << "\n";
+
+	std::vector<std::string> enabledNames;
+	for (const std::string& name : requestedNames)
+		if (rt_supported || name == baselineNames[0] || (optional && baselineSet.find(name) == baselineSet.end()))
+			enabledNames.emplace_back(name);
+	std::vector<std::string> deduplicated;
+	std::unordered_set<std::string> seen;
+	for (const std::string& name : enabledNames)
+		if (seen.emplace(name).second)
+			deduplicated.emplace_back(name);
+	enabledNames = std::move(deduplicated);
+	std::vector<const char*> extensionPointers;
+	for (const std::string& name : enabledNames)
+		extensionPointers.emplace_back(name.c_str());
+
+	const float queue_priority[] = { 1.0f };
+	VkDeviceQueueCreateInfo queue_info = {};
+	queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+	queue_info.queueFamilyIndex = g_QueueFamily;
+	queue_info.queueCount = 1;
+	queue_info.pQueuePriorities = queue_priority;
+	VkDeviceCreateInfo create_info = {};
+	create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	create_info.queueCreateInfoCount = 1;
+	create_info.pQueueCreateInfos = &queue_info;
+	create_info.enabledExtensionCount = static_cast<uint32_t>(extensionPointers.size());
+	create_info.ppEnabledExtensionNames = extensionPointers.data();
+	if (rt_supported)
+	{
+		buffer_device_address_features.bufferDeviceAddress = VK_TRUE;
+		accel_features.accelerationStructure = VK_TRUE;
+		ray_query_features.rayQuery = VK_TRUE;
+		if (rt_pipeline_supported)
+			rt_pipeline_features.rayTracingPipeline = VK_TRUE;
+		descriptor_indexing_features.descriptorBindingPartiallyBound = VK_TRUE;
+		descriptor_indexing_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
+		descriptor_indexing_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+		descriptor_indexing_features.runtimeDescriptorArray = VK_TRUE;
+		dynamic_rendering_features.dynamicRendering = VK_TRUE;
+		vulkan11_features.shaderDrawParameters = VK_TRUE;
+		create_info.pNext = &device_features2;
+		std::cerr << "[RT2] Vulkan Ray Tracing extensions enabled (pipeline="
+		          << (rt_pipeline_supported ? "yes" : "no") << ").\n";
+	}
+	else
+		std::cerr << "[RT2] WARNING: Ray Tracing not supported on this device. Falling back to CPU renderer.\n";
+
+	VkResult err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &device);
+	if (err == VK_SUCCESS)
+	{
+		vkGetDeviceQueue(device, g_QueueFamily, 0, &g_Queue);
+		RTDispatchInit(device);
+	}
+	return err;
+}
+
 static void SetupVulkan(
 	const Walnut::ApplicationSpecification& specification,
 	std::vector<Walnut::OptionalVulkanFeatureDiagnostic>& diagnostics,
@@ -156,493 +355,111 @@ static void SetupVulkan(
 	const char** extensions,
 	uint32_t extensions_count)
 {
-	VkResult err;
 	optionalFeatureEnabled = false;
 	instanceExtensionStorage.clear();
 	deviceExtensionStorage.clear();
 
-	std::optional<Walnut::OptionalVulkanFeatureRequirements> optionalRequirements;
-	std::string optionalFeatureName = "optional-vulkan-feature";
-	if (specification.optionalVulkanFeatureProvider)
-	{
-		try
-		{
-			Walnut::Result<Walnut::OptionalVulkanFeatureRequirements> result = specification.optionalVulkanFeatureProvider();
-			if (!result)
-			{
-				PublishOptionalDiagnostic(specification, diagnostics, {
-					optionalFeatureName,
-					Walnut::OptionalVulkanFeatureRequirementPhase::Provider,
-					Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
-					{}, VK_SUCCESS,
-					result.error.empty() ? "provider returned failure" : result.error});
-			}
-			else
-			{
-				optionalRequirements = std::move(result.value);
-				if (!optionalRequirements->featureName.empty())
-					optionalFeatureName = optionalRequirements->featureName;
-			}
-		}
-		catch (const std::exception& exception)
-		{
-			PublishOptionalDiagnostic(specification, diagnostics, {
-				optionalFeatureName,
-				Walnut::OptionalVulkanFeatureRequirementPhase::Provider,
-				Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
-				{}, VK_SUCCESS,
-				std::string("provider threw an exception: ") + exception.what()});
-		}
-		catch (...)
-		{
-			PublishOptionalDiagnostic(specification, diagnostics, {
-				optionalFeatureName,
-				Walnut::OptionalVulkanFeatureRequirementPhase::Provider,
-				Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
-				{}, VK_SUCCESS,
-				"provider threw an unknown exception"});
-		}
-	}
-
-	// GLFW owns its returned array. Copy required and optional names into
-	// separate application-owned storage so an optional create can be retried
-	// with exactly the baseline set.
-	std::vector<std::string> baselineInstanceExtensionStorage;
-	std::vector<std::string> optionalInstanceExtensionStorage;
+	const bool useValidation = g_EnableRuntimeValidation
+#ifdef IMGUI_VULKAN_DEBUG_REPORT
+		|| true
+#endif
+		;
+	std::vector<std::string> baselineInstanceExtensions;
+	baselineInstanceExtensions.reserve(extensions_count + (useValidation ? 1 : 0));
 	for (uint32_t i = 0; i < extensions_count; ++i)
 		if (extensions && extensions[i])
-			baselineInstanceExtensionStorage.emplace_back(extensions[i]);
+			baselineInstanceExtensions.emplace_back(extensions[i]);
+	if (useValidation)
+		baselineInstanceExtensions.emplace_back("VK_EXT_debug_report");
 
-	if (optionalRequirements)
-	{
-		std::vector<VkExtensionProperties> available;
-		VkResult enumerationResult = VK_SUCCESS;
-		if (!EnumerateInstanceExtensions(available, enumerationResult))
-		{
-			PublishOptionalDiagnostic(specification, diagnostics, {
-				optionalFeatureName,
-				Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
-				Walnut::OptionalVulkanFeatureDisableReason::ExtensionEnumerationFailure,
-				{}, enumerationResult,
-				"vkEnumerateInstanceExtensionProperties failed"});
-			optionalRequirements.reset();
-		}
-		else
-		{
-			const auto selection = Walnut::DeduplicateAndValidateVulkanExtensions(optionalRequirements->instanceExtensions, available);
-			if (!selection.missing.empty())
-			{
-				PublishOptionalDiagnostic(specification, diagnostics, {
-					optionalFeatureName,
-					Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
-					Walnut::OptionalVulkanFeatureDisableReason::MissingExtension,
-					selection.missing, VK_SUCCESS,
-					"one or more optional instance extensions are unavailable"});
-				optionalRequirements.reset();
-			}
-			else
-			{
-				optionalInstanceExtensionStorage = selection.enabled;
-			}
-		}
-	}
-
-	auto deduplicateNames = [](std::vector<std::string>& names) {
-		std::vector<std::string> deduplicated;
-		deduplicated.reserve(names.size());
-		std::unordered_set<std::string> seen;
-		for (const std::string& name : names)
-			if (seen.emplace(name).second)
-				deduplicated.emplace_back(name);
-		names = std::move(deduplicated);
+	const std::vector<std::string> baselineDeviceExtensions = {
+		"VK_KHR_swapchain",
+		"VK_KHR_acceleration_structure",
+		"VK_KHR_ray_query",
+		"VK_KHR_ray_tracing_pipeline",
+		"VK_KHR_buffer_device_address",
+		"VK_KHR_deferred_host_operations",
+		"VK_KHR_storage_buffer_storage_class",
+		"VK_KHR_spirv_1_4",
+		"VK_KHR_shader_float_controls",
+		"VK_KHR_shader_non_semantic_info",
+		"VK_EXT_descriptor_indexing",
+		"VK_KHR_synchronization2",
+		"VK_KHR_create_renderpass2",
+		"VK_KHR_dynamic_rendering",
+		"VK_KHR_ray_tracing_maintenance1",
+		"VK_EXT_memory_budget"
 	};
-	deduplicateNames(baselineInstanceExtensionStorage);
-	deduplicateNames(optionalInstanceExtensionStorage);
-	const bool optionalInstanceRequirementsActive = optionalRequirements.has_value();
 
-	// Create Vulkan Instance
+	Walnut::OptionalVulkanRequirementsHooks hooks;
+	hooks.enumerateInstanceExtensions = [] {
+		std::vector<VkExtensionProperties> available;
+		VkResult result = VK_SUCCESS;
+		if (!EnumerateInstanceExtensions(available, result))
+			return Walnut::Result<std::vector<VkExtensionProperties>>::Failure(
+				"vkEnumerateInstanceExtensionProperties failed", result);
+		return Walnut::Result<std::vector<VkExtensionProperties>>::Success(std::move(available));
+	};
+	hooks.enumerateDeviceExtensions = [](VkInstance, VkPhysicalDevice physicalDevice) {
+		std::vector<VkExtensionProperties> available;
+		VkResult result = VK_SUCCESS;
+		if (!EnumerateDeviceExtensions(physicalDevice, available, result))
+			return Walnut::Result<std::vector<VkExtensionProperties>>::Failure(
+				"vkEnumerateDeviceExtensionProperties failed", result);
+		return Walnut::Result<std::vector<VkExtensionProperties>>::Success(std::move(available));
+	};
+	hooks.createInstance = [](const std::vector<std::string>& names, bool optional, VkInstance& instance) {
+		const VkResult result = CreateVulkanInstance(names, optional, instance);
+		g_Instance = result == VK_SUCCESS ? instance : VK_NULL_HANDLE;
+		return result;
+	};
+	hooks.selectPhysicalDevice = [](VkInstance instance) {
+		g_PhysicalDevice = SelectPhysicalDevice(instance);
+		return g_PhysicalDevice;
+	};
+	hooks.createDevice = [](VkInstance, VkPhysicalDevice physicalDevice, const std::vector<std::string>& names, bool optional, VkDevice& device) {
+		const VkResult result = CreateLogicalDevice(physicalDevice, names, optional, device);
+		g_Device = result == VK_SUCCESS ? device : VK_NULL_HANDLE;
+		return result;
+	};
+
+	const Walnut::OptionalVulkanRequirementsExecution execution =
+		Walnut::RunOptionalVulkanRequirements(
+			specification.optionalVulkanFeatureProvider,
+			baselineInstanceExtensions,
+			baselineDeviceExtensions,
+			hooks);
+	for (const Walnut::OptionalVulkanFeatureDiagnostic& diagnostic : execution.diagnostics)
+		PublishOptionalDiagnostic(specification, diagnostics, diagnostic);
+
+	instanceExtensionStorage = execution.instanceExtensions;
+	deviceExtensionStorage = execution.deviceExtensions;
+	optionalFeatureEnabled = execution.optionalFeatureEnabled;
+
+	if (execution.baselineInstanceCreateFailed)
+		check_vk_result(execution.baselineInstanceCreateResult);
+	if (execution.baselineDeviceCreateFailed)
+		check_vk_result(execution.baselineDeviceCreateResult);
+
+	if (useValidation)
 	{
-		VkApplicationInfo app_info = {};
-		app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-		app_info.pApplicationName = "RT2";
-		app_info.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-		app_info.pEngineName = "RT2";
-		app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-		app_info.apiVersion = VK_API_VERSION_1_2;
+		// Get the function pointer (required for any extensions).
+		auto vkCreateDebugReportCallbackEXT =
+			(PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkCreateDebugReportCallbackEXT");
+		IM_ASSERT(vkCreateDebugReportCallbackEXT != NULL);
 
-#if defined(IMGUI_VULKAN_DEBUG_REPORT) || 1
-		const bool useValidation = g_EnableRuntimeValidation
-#ifdef IMGUI_VULKAN_DEBUG_REPORT
-			|| true
-#endif
-			;
-		std::vector<std::string> instanceCreateStorage = baselineInstanceExtensionStorage;
-		if (optionalInstanceRequirementsActive)
-			instanceCreateStorage.insert(instanceCreateStorage.end(), optionalInstanceExtensionStorage.begin(), optionalInstanceExtensionStorage.end());
-		deduplicateNames(instanceCreateStorage);
-		if (useValidation && std::find(baselineInstanceExtensionStorage.begin(), baselineInstanceExtensionStorage.end(), "VK_EXT_debug_report") == baselineInstanceExtensionStorage.end())
-			baselineInstanceExtensionStorage.emplace_back("VK_EXT_debug_report");
-		if (useValidation)
-		{
-			instanceCreateStorage = baselineInstanceExtensionStorage;
-			if (optionalInstanceRequirementsActive)
-				instanceCreateStorage.insert(instanceCreateStorage.end(), optionalInstanceExtensionStorage.begin(), optionalInstanceExtensionStorage.end());
-			deduplicateNames(instanceCreateStorage);
-		}
-
-		VkApplicationInfo* applicationInfo = &app_info;
-		VkInstanceCreateInfo create_info = {};
-		create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-		create_info.pApplicationInfo = applicationInfo;
-		const char* validationLayers[] = { "VK_LAYER_KHRONOS_validation" };
-		VkValidationFeaturesEXT validationFeatures = {};
-		VkValidationFeatureEnableEXT enabledFeatures[1] = { VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT };
-		if (useValidation)
-		{
-			create_info.enabledLayerCount = 1;
-			create_info.ppEnabledLayerNames = validationLayers;
-			if (g_EnableSyncValidation)
-			{
-				validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
-				validationFeatures.enabledValidationFeatureCount = 1;
-				validationFeatures.pEnabledValidationFeatures = enabledFeatures;
-				create_info.pNext = &validationFeatures;
-			}
-		}
-		std::vector<const char*> instanceExtensionPointers;
-		auto createInstance = [&](const std::vector<std::string>& names) {
-			instanceExtensionPointers.clear();
-			instanceExtensionPointers.reserve(names.size());
-			for (const std::string& name : names)
-				instanceExtensionPointers.emplace_back(name.c_str());
-			create_info.enabledExtensionCount = static_cast<uint32_t>(instanceExtensionPointers.size());
-			create_info.ppEnabledExtensionNames = instanceExtensionPointers.data();
-			return vkCreateInstance(&create_info, g_Allocator, &g_Instance);
-		};
-
-		err = createInstance(instanceCreateStorage);
-		if (err != VK_SUCCESS && optionalInstanceRequirementsActive)
-		{
-			PublishOptionalDiagnostic(specification, diagnostics, {
-				optionalFeatureName,
-				Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
-				Walnut::OptionalVulkanFeatureDisableReason::InstanceCreateFailure,
-				{}, err,
-				"vkCreateInstance failed with optional requirements; baseline retry performed"});
-			optionalRequirements.reset();
-			optionalFeatureEnabled = false;
-			instanceCreateStorage = baselineInstanceExtensionStorage;
-			g_Instance = VK_NULL_HANDLE;
-			err = createInstance(instanceCreateStorage);
-		}
-		check_vk_result(err);
-		instanceExtensionStorage = instanceCreateStorage;
-
-		if (useValidation)
-		{
-			// Get the function pointer (required for any extensions)
-			auto vkCreateDebugReportCallbackEXT = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkCreateDebugReportCallbackEXT");
-			IM_ASSERT(vkCreateDebugReportCallbackEXT != NULL);
-
-			// Setup the debug report callback
-			VkDebugReportCallbackCreateInfoEXT debug_report_ci = {};
-			debug_report_ci.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
-			debug_report_ci.flags = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT | VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT;
-			debug_report_ci.pfnCallback = debug_report;
-			debug_report_ci.pUserData = NULL;
-			err = vkCreateDebugReportCallbackEXT(g_Instance, &debug_report_ci, g_Allocator, &g_DebugReport);
-			check_vk_result(err);
-		}
-		else
-			IM_UNUSED(g_DebugReport);
+		VkDebugReportCallbackCreateInfoEXT debug_report_ci = {};
+		debug_report_ci.sType = VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT;
+		debug_report_ci.flags = VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT |
+			VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT;
+		debug_report_ci.pfnCallback = debug_report;
+		debug_report_ci.pUserData = NULL;
+		VkResult result = vkCreateDebugReportCallbackEXT(g_Instance, &debug_report_ci, g_Allocator, &g_DebugReport);
+		check_vk_result(result);
 	}
-#endif
-
-	// Select GPU
+	else
 	{
-		uint32_t gpu_count;
-		err = vkEnumeratePhysicalDevices(g_Instance, &gpu_count, NULL);
-		check_vk_result(err);
-		IM_ASSERT(gpu_count > 0);
-
-		VkPhysicalDevice* gpus = (VkPhysicalDevice*)malloc(sizeof(VkPhysicalDevice) * gpu_count);
-		err = vkEnumeratePhysicalDevices(g_Instance, &gpu_count, gpus);
-		check_vk_result(err);
-
-		// If a number >1 of GPUs got reported, find discrete GPU if present, or use first one available. This covers
-		// most common cases (multi-gpu/integrated+dedicated graphics). Handling more complicated setups (multiple
-		// dedicated GPUs) is out of scope of this sample.
-		int use_gpu = 0;
-		for (int i = 0; i < (int)gpu_count; i++)
-		{
-			VkPhysicalDeviceProperties properties;
-			vkGetPhysicalDeviceProperties(gpus[i], &properties);
-			if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-			{
-				use_gpu = i;
-				break;
-			}
-		}
-
-		g_PhysicalDevice = gpus[use_gpu];
-		free(gpus);
-	}
-
-	// The provider's second phase is deliberately after physical-device
-	// selection.  Its strings are copied into application-owned storage before
-	// the later vkCreateDevice call.
-	if (optionalRequirements)
-	{
-		std::vector<std::string> requestedDeviceExtensions;
-		if (optionalRequirements->deviceExtensions)
-		{
-			try
-			{
-				Walnut::Result<std::vector<std::string>> result = optionalRequirements->deviceExtensions(g_Instance, g_PhysicalDevice);
-				if (!result)
-				{
-					PublishOptionalDiagnostic(specification, diagnostics, {
-						optionalFeatureName,
-						Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
-						Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
-						{}, VK_SUCCESS,
-						result.error.empty() ? "device extension provider returned failure" : result.error});
-					optionalRequirements.reset();
-				}
-				else
-				{
-					requestedDeviceExtensions = std::move(result.value);
-				}
-			}
-			catch (const std::exception& exception)
-			{
-				PublishOptionalDiagnostic(specification, diagnostics, {
-					optionalFeatureName,
-					Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
-					Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
-					{}, VK_SUCCESS,
-					std::string("device extension provider threw an exception: ") + exception.what()});
-				optionalRequirements.reset();
-			}
-			catch (...)
-			{
-				PublishOptionalDiagnostic(specification, diagnostics, {
-					optionalFeatureName,
-					Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
-					Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
-					{}, VK_SUCCESS,
-					"device extension provider threw an unknown exception"});
-				optionalRequirements.reset();
-			}
-		}
-
-		if (optionalRequirements)
-		{
-			std::vector<VkExtensionProperties> available;
-			VkResult enumerationResult = VK_SUCCESS;
-			if (!EnumerateDeviceExtensions(g_PhysicalDevice, available, enumerationResult))
-			{
-				PublishOptionalDiagnostic(specification, diagnostics, {
-					optionalFeatureName,
-					Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
-					Walnut::OptionalVulkanFeatureDisableReason::ExtensionEnumerationFailure,
-					{}, enumerationResult,
-					"vkEnumerateDeviceExtensionProperties failed"});
-				optionalRequirements.reset();
-			}
-			else
-			{
-				const auto selection = Walnut::DeduplicateAndValidateVulkanExtensions(requestedDeviceExtensions, available);
-				if (!selection.missing.empty())
-				{
-					PublishOptionalDiagnostic(specification, diagnostics, {
-						optionalFeatureName,
-						Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
-						Walnut::OptionalVulkanFeatureDisableReason::MissingExtension,
-						selection.missing, VK_SUCCESS,
-						"one or more optional device extensions are unavailable"});
-					optionalRequirements.reset();
-				}
-				else
-				{
-					deviceExtensionStorage = selection.enabled;
-					optionalFeatureEnabled = true;
-				}
-				}
-			}
-		}
-	// Select graphics queue family
-	{
-		uint32_t count;
-		vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, NULL);
-		VkQueueFamilyProperties* queues = (VkQueueFamilyProperties*)malloc(sizeof(VkQueueFamilyProperties) * count);
-		vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, queues);
-		for (uint32_t i = 0; i < count; i++)
-			if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
-			{
-				g_QueueFamily = i;
-				break;
-			}
-		free(queues);
-		IM_ASSERT(g_QueueFamily != (uint32_t)-1);
-	}
-
-	// Create Logical Device (with 1 queue)
-	{
-		const char* device_extensions[] = {
-			"VK_KHR_swapchain",
-			"VK_KHR_acceleration_structure",
-			"VK_KHR_ray_query",
-			"VK_KHR_ray_tracing_pipeline",
-			"VK_KHR_buffer_device_address",
-			"VK_KHR_deferred_host_operations",
-			"VK_KHR_storage_buffer_storage_class",
-			"VK_KHR_spirv_1_4",
-			"VK_KHR_shader_float_controls",
-			"VK_KHR_shader_non_semantic_info",
-			"VK_EXT_descriptor_indexing",
-			"VK_KHR_synchronization2",
-			"VK_KHR_create_renderpass2",
-			"VK_KHR_dynamic_rendering",
-			"VK_KHR_ray_tracing_maintenance1",
-			"VK_EXT_memory_budget"
-		};
-		// Query RT feature support
-		VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features = {};
-		buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-
-		VkPhysicalDeviceAccelerationStructureFeaturesKHR accel_features = {};
-		accel_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-		accel_features.pNext = &buffer_device_address_features;
-
-		VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features = {};
-		ray_query_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-		ray_query_features.pNext = &accel_features;
-
-		VkPhysicalDeviceRayTracingPipelineFeaturesKHR rt_pipeline_features = {};
-		rt_pipeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-		rt_pipeline_features.pNext = &ray_query_features;
-
-		VkPhysicalDeviceDescriptorIndexingFeaturesEXT descriptor_indexing_features = {};
-		descriptor_indexing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
-		descriptor_indexing_features.pNext = &rt_pipeline_features;
-
-		VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering_features = {};
-		dynamic_rendering_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
-		dynamic_rendering_features.pNext = &descriptor_indexing_features;
-
-		VkPhysicalDeviceVulkan11Features vulkan11_features = {};
-		vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
-		vulkan11_features.pNext = &dynamic_rendering_features;
-
-		VkPhysicalDeviceFeatures2 device_features2 = {};
-		device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-		device_features2.pNext = &vulkan11_features;
-
-		vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features2);
-
-		bool rt_supported = buffer_device_address_features.bufferDeviceAddress == VK_TRUE &&
-		                    accel_features.accelerationStructure == VK_TRUE &&
-		                    ray_query_features.rayQuery == VK_TRUE;
-
-		bool rt_pipeline_supported = rt_supported &&
-		                              rt_pipeline_features.rayTracingPipeline == VK_TRUE;
-
-		const bool optionalDeviceRequirementsActive = optionalFeatureEnabled;
-		const std::vector<std::string> optionalDeviceExtensionStorage = deviceExtensionStorage;
-		std::vector<std::string> baselineDeviceExtensionStorage(
-			device_extensions, device_extensions + IM_ARRAYSIZE(device_extensions));
-		if (!rt_supported)
-			baselineDeviceExtensionStorage.resize(1);
-		std::vector<std::string> deviceCreateStorage = baselineDeviceExtensionStorage;
-		if (optionalDeviceRequirementsActive)
-			deviceCreateStorage.insert(deviceCreateStorage.end(), optionalDeviceExtensionStorage.begin(), optionalDeviceExtensionStorage.end());
-		deduplicateNames(deviceCreateStorage);
-		std::vector<const char*> deviceExtensionPointers;
-		deviceExtensionPointers.reserve(deviceCreateStorage.size());
-		for (const std::string& name : deviceCreateStorage)
-			deviceExtensionPointers.emplace_back(name.c_str());
-		uint32_t device_extension_count = static_cast<uint32_t>(deviceExtensionPointers.size());
-
-		g_RayTracingSupported = rt_supported;
-		g_RayTracingPipelineSupported = rt_pipeline_supported;
-
-		// Query RT pipeline properties (SBT alignment/handle size, max recursion depth)
-		g_RTPipelineProperties = {};
-		g_RTPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
-		VkPhysicalDeviceProperties2 physical_device_properties2 = {};
-		physical_device_properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-		physical_device_properties2.pNext = &g_RTPipelineProperties;
-		vkGetPhysicalDeviceProperties2(g_PhysicalDevice, &physical_device_properties2);
-
-		std::cerr << "[RT2] RT props: maxRayRecursionDepth=" << g_RTPipelineProperties.maxRayRecursionDepth
-		          << " shaderGroupHandleSize=" << g_RTPipelineProperties.shaderGroupHandleSize
-		          << " baseAlignment=" << g_RTPipelineProperties.shaderGroupBaseAlignment
-		          << " handleAlignment=" << g_RTPipelineProperties.shaderGroupHandleAlignment << "\n";
-
-		const float queue_priority[] = { 1.0f };
-		VkDeviceQueueCreateInfo queue_info[1] = {};
-		queue_info[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-		queue_info[0].queueFamilyIndex = g_QueueFamily;
-		queue_info[0].queueCount = 1;
-		queue_info[0].pQueuePriorities = queue_priority;
-
-		VkDeviceCreateInfo create_info = {};
-		create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-		create_info.queueCreateInfoCount = sizeof(queue_info) / sizeof(queue_info[0]);
-		create_info.pQueueCreateInfos = queue_info;
-		create_info.enabledExtensionCount = device_extension_count;
-		create_info.ppEnabledExtensionNames = deviceExtensionPointers.data();
-
-		if (rt_supported)
-		{
-			// Enable the features we queried
-			buffer_device_address_features.bufferDeviceAddress = VK_TRUE;
-			accel_features.accelerationStructure = VK_TRUE;
-			ray_query_features.rayQuery = VK_TRUE;
-			if (rt_pipeline_supported)
-				rt_pipeline_features.rayTracingPipeline = VK_TRUE;
-			// Enable descriptor indexing for bindless texture arrays
-			descriptor_indexing_features.descriptorBindingPartiallyBound = VK_TRUE;
-			descriptor_indexing_features.descriptorBindingVariableDescriptorCount = VK_TRUE;
-			descriptor_indexing_features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-			descriptor_indexing_features.runtimeDescriptorArray = VK_TRUE;
-			dynamic_rendering_features.dynamicRendering = VK_TRUE;
-			vulkan11_features.shaderDrawParameters = VK_TRUE;
-			create_info.pNext = &device_features2;
-			std::cerr << "[RT2] Vulkan Ray Tracing extensions enabled (pipeline=" << (rt_pipeline_supported ? "yes" : "no") << ").\n";
-		}
-		else
-		{
-			std::cerr << "[RT2] WARNING: Ray Tracing not supported on this device. Falling back to CPU renderer.\n";
-		}
-
-		err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
-		if (err != VK_SUCCESS && optionalDeviceRequirementsActive)
-		{
-			PublishOptionalDiagnostic(specification, diagnostics, {
-				optionalFeatureName,
-				Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
-				Walnut::OptionalVulkanFeatureDisableReason::DeviceCreateFailure,
-				{}, err,
-				"vkCreateDevice failed with optional requirements; baseline retry performed"});
-			optionalFeatureEnabled = false;
-			deviceCreateStorage = baselineDeviceExtensionStorage;
-			deviceExtensionPointers.clear();
-			for (const std::string& name : deviceCreateStorage)
-				deviceExtensionPointers.emplace_back(name.c_str());
-			device_extension_count = static_cast<uint32_t>(deviceExtensionPointers.size());
-			create_info.enabledExtensionCount = device_extension_count;
-			create_info.ppEnabledExtensionNames = deviceExtensionPointers.data();
-			g_Device = VK_NULL_HANDLE;
-			err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
-		}
-		check_vk_result(err);
-		deviceExtensionStorage = std::move(deviceCreateStorage);
-		vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
-
-		// Cache RT entry points now that the device exists.
-		RTDispatchInit(g_Device);
+		IM_UNUSED(g_DebugReport);
 	}
 
 	// Create Descriptor Pool
@@ -668,7 +485,7 @@ static void SetupVulkan(
 		pool_info.maxSets = 1000 * IM_ARRAYSIZE(pool_sizes);
 		pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
 		pool_info.pPoolSizes = pool_sizes;
-		err = vkCreateDescriptorPool(g_Device, &pool_info, g_Allocator, &g_DescriptorPool);
+		VkResult err = vkCreateDescriptorPool(g_Device, &pool_info, g_Allocator, &g_DescriptorPool);
 		check_vk_result(err);
 	}
 }
