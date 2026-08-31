@@ -16,6 +16,9 @@
 #include <glm/glm.hpp>
 
 #include <iostream>
+#include <exception>
+#include <optional>
+#include <unordered_set>
 
 // Emedded font
 #include "ImGui/Roboto-Regular.embed"
@@ -97,9 +100,165 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_report(VkDebugReportFlagsEXT flags, 
 	return VK_FALSE;
 }
 
-static void SetupVulkan(const char** extensions, uint32_t extensions_count)
+static void PublishOptionalDiagnostic(
+	const Walnut::ApplicationSpecification& specification,
+	std::vector<Walnut::OptionalVulkanFeatureDiagnostic>& diagnostics,
+	Walnut::OptionalVulkanFeatureDiagnostic diagnostic)
+{
+	diagnostics.emplace_back(diagnostic);
+	if (specification.optionalVulkanFeatureDiagnosticSink)
+		specification.optionalVulkanFeatureDiagnosticSink(diagnostics.back());
+
+	std::cerr << "[Walnut] optional Vulkan feature '" << diagnostic.featureName
+		          << "' disabled: " << diagnostic.message << "\n";
+}
+
+static bool EnumerateInstanceExtensions(std::vector<VkExtensionProperties>& extensions, VkResult& result)
+{
+	uint32_t count = 0;
+	result = vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+	if (result != VK_SUCCESS)
+		return false;
+	extensions.resize(count);
+	result = vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data());
+	if (result != VK_SUCCESS)
+	{
+		extensions.clear();
+		return false;
+	}
+	extensions.resize(count);
+	return true;
+}
+
+static bool EnumerateDeviceExtensions(VkPhysicalDevice physicalDevice, std::vector<VkExtensionProperties>& extensions, VkResult& result)
+{
+	uint32_t count = 0;
+	result = vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, nullptr);
+	if (result != VK_SUCCESS)
+		return false;
+	extensions.resize(count);
+	result = vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &count, extensions.data());
+	if (result != VK_SUCCESS)
+	{
+		extensions.clear();
+		return false;
+	}
+	extensions.resize(count);
+	return true;
+}
+
+static void SetupVulkan(
+	const Walnut::ApplicationSpecification& specification,
+	std::vector<Walnut::OptionalVulkanFeatureDiagnostic>& diagnostics,
+	std::vector<std::string>& instanceExtensionStorage,
+	std::vector<std::string>& deviceExtensionStorage,
+	bool& optionalFeatureEnabled,
+	const char** extensions,
+	uint32_t extensions_count)
 {
 	VkResult err;
+	optionalFeatureEnabled = false;
+	instanceExtensionStorage.clear();
+	deviceExtensionStorage.clear();
+
+	std::optional<Walnut::OptionalVulkanFeatureRequirements> optionalRequirements;
+	std::string optionalFeatureName = "optional-vulkan-feature";
+	if (specification.optionalVulkanFeatureProvider)
+	{
+		try
+		{
+			Walnut::Result<Walnut::OptionalVulkanFeatureRequirements> result = specification.optionalVulkanFeatureProvider();
+			if (!result)
+			{
+				PublishOptionalDiagnostic(specification, diagnostics, {
+					optionalFeatureName,
+					Walnut::OptionalVulkanFeatureRequirementPhase::Provider,
+					Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
+					{}, VK_SUCCESS,
+					result.error.empty() ? "provider returned failure" : result.error});
+			}
+			else
+			{
+				optionalRequirements = std::move(result.value);
+				if (!optionalRequirements->featureName.empty())
+					optionalFeatureName = optionalRequirements->featureName;
+			}
+		}
+		catch (const std::exception& exception)
+		{
+			PublishOptionalDiagnostic(specification, diagnostics, {
+				optionalFeatureName,
+				Walnut::OptionalVulkanFeatureRequirementPhase::Provider,
+				Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
+				{}, VK_SUCCESS,
+				std::string("provider threw an exception: ") + exception.what()});
+		}
+		catch (...)
+		{
+			PublishOptionalDiagnostic(specification, diagnostics, {
+				optionalFeatureName,
+				Walnut::OptionalVulkanFeatureRequirementPhase::Provider,
+				Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
+				{}, VK_SUCCESS,
+				"provider threw an unknown exception"});
+		}
+	}
+
+	// GLFW owns its returned array.  Copy every name before adding optional
+	// requirements so no SDK/GLFW pointer can outlive its owner.
+	for (uint32_t i = 0; i < extensions_count; ++i)
+		if (extensions && extensions[i])
+			instanceExtensionStorage.emplace_back(extensions[i]);
+
+	if (optionalRequirements)
+	{
+		std::vector<VkExtensionProperties> available;
+		VkResult enumerationResult = VK_SUCCESS;
+		if (!EnumerateInstanceExtensions(available, enumerationResult))
+		{
+			PublishOptionalDiagnostic(specification, diagnostics, {
+				optionalFeatureName,
+				Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
+				Walnut::OptionalVulkanFeatureDisableReason::ExtensionEnumerationFailure,
+				{}, enumerationResult,
+				"vkEnumerateInstanceExtensionProperties failed"});
+			optionalRequirements.reset();
+		}
+		else
+		{
+			const auto selection = Walnut::DeduplicateAndValidateVulkanExtensions(optionalRequirements->instanceExtensions, available);
+			if (!selection.missing.empty())
+			{
+				PublishOptionalDiagnostic(specification, diagnostics, {
+					optionalFeatureName,
+					Walnut::OptionalVulkanFeatureRequirementPhase::InstanceExtensions,
+					Walnut::OptionalVulkanFeatureDisableReason::MissingExtension,
+					selection.missing, VK_SUCCESS,
+					"one or more optional instance extensions are unavailable"});
+				optionalRequirements.reset();
+			}
+			else
+			{
+				instanceExtensionStorage.insert(instanceExtensionStorage.end(), selection.enabled.begin(), selection.enabled.end());
+			}
+		}
+	}
+
+	// Required GLFW extensions remain enabled exactly as before; only duplicate
+	// names are removed at the Vulkan boundary.
+	{
+		std::vector<std::string> deduplicated;
+		deduplicated.reserve(instanceExtensionStorage.size());
+		std::unordered_set<std::string> seen;
+		for (const std::string& name : instanceExtensionStorage)
+			if (seen.emplace(name).second)
+				deduplicated.emplace_back(name);
+		instanceExtensionStorage = std::move(deduplicated);
+	}
+	std::vector<const char*> instanceExtensionPointers;
+	instanceExtensionPointers.reserve(instanceExtensionStorage.size());
+	for (const std::string& name : instanceExtensionStorage)
+		instanceExtensionPointers.emplace_back(name.c_str());
 
 	// Create Vulkan Instance
 	{
@@ -114,8 +273,8 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		VkInstanceCreateInfo create_info = {};
 		create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 		create_info.pApplicationInfo = &app_info;
-		create_info.enabledExtensionCount = extensions_count;
-		create_info.ppEnabledExtensionNames = extensions;
+		create_info.enabledExtensionCount = static_cast<uint32_t>(instanceExtensionPointers.size());
+		create_info.ppEnabledExtensionNames = instanceExtensionPointers.data();
 #if defined(IMGUI_VULKAN_DEBUG_REPORT) || 1
 		const bool useValidation = g_EnableRuntimeValidation
 #ifdef IMGUI_VULKAN_DEBUG_REPORT
@@ -130,11 +289,13 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			create_info.ppEnabledLayerNames = layers;
 
 			// Enable debug report extension (we need additional storage, so we duplicate the user array to add our new extension to it)
-			const char** extensions_ext = (const char**)malloc(sizeof(const char*) * (extensions_count + 1));
-			memcpy(extensions_ext, extensions, extensions_count * sizeof(const char*));
-			extensions_ext[extensions_count] = "VK_EXT_debug_report";
-			create_info.enabledExtensionCount = extensions_count + 1;
-			create_info.ppEnabledExtensionNames = extensions_ext;
+			if (std::find(instanceExtensionStorage.begin(), instanceExtensionStorage.end(), "VK_EXT_debug_report") == instanceExtensionStorage.end())
+				instanceExtensionStorage.emplace_back("VK_EXT_debug_report");
+			instanceExtensionPointers.clear();
+			for (const std::string& name : instanceExtensionStorage)
+				instanceExtensionPointers.emplace_back(name.c_str());
+			create_info.enabledExtensionCount = static_cast<uint32_t>(instanceExtensionPointers.size());
+			create_info.ppEnabledExtensionNames = instanceExtensionPointers.data();
 
 			// Optional: sync validation via VkValidationFeaturesEXT
 			VkValidationFeaturesEXT validationFeatures = {};
@@ -152,8 +313,6 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			// Create Vulkan Instance
 			err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
 			check_vk_result(err);
-			free(extensions_ext);
-
 			// Get the function pointer (required for any extensions)
 			auto vkCreateDebugReportCallbackEXT = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(g_Instance, "vkCreateDebugReportCallbackEXT");
 			IM_ASSERT(vkCreateDebugReportCallbackEXT != NULL);
@@ -207,6 +366,89 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		free(gpus);
 	}
 
+	// The provider's second phase is deliberately after physical-device
+	// selection.  Its strings are copied into application-owned storage before
+	// the later vkCreateDevice call.
+	if (optionalRequirements)
+	{
+		std::vector<std::string> requestedDeviceExtensions;
+		if (optionalRequirements->deviceExtensions)
+		{
+			try
+			{
+				Walnut::Result<std::vector<std::string>> result = optionalRequirements->deviceExtensions(g_Instance, g_PhysicalDevice);
+				if (!result)
+				{
+					PublishOptionalDiagnostic(specification, diagnostics, {
+						optionalFeatureName,
+						Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+						Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
+						{}, VK_SUCCESS,
+						result.error.empty() ? "device extension provider returned failure" : result.error});
+					optionalRequirements.reset();
+				}
+				else
+				{
+					requestedDeviceExtensions = std::move(result.value);
+				}
+			}
+			catch (const std::exception& exception)
+			{
+				PublishOptionalDiagnostic(specification, diagnostics, {
+					optionalFeatureName,
+					Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+					Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
+					{}, VK_SUCCESS,
+					std::string("device extension provider threw an exception: ") + exception.what()});
+				optionalRequirements.reset();
+			}
+			catch (...)
+			{
+				PublishOptionalDiagnostic(specification, diagnostics, {
+					optionalFeatureName,
+					Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+					Walnut::OptionalVulkanFeatureDisableReason::ProviderFailure,
+					{}, VK_SUCCESS,
+					"device extension provider threw an unknown exception"});
+				optionalRequirements.reset();
+			}
+		}
+
+		if (optionalRequirements)
+		{
+			std::vector<VkExtensionProperties> available;
+			VkResult enumerationResult = VK_SUCCESS;
+			if (!EnumerateDeviceExtensions(g_PhysicalDevice, available, enumerationResult))
+			{
+				PublishOptionalDiagnostic(specification, diagnostics, {
+					optionalFeatureName,
+					Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+					Walnut::OptionalVulkanFeatureDisableReason::ExtensionEnumerationFailure,
+					{}, enumerationResult,
+					"vkEnumerateDeviceExtensionProperties failed"});
+				optionalRequirements.reset();
+			}
+			else
+			{
+				const auto selection = Walnut::DeduplicateAndValidateVulkanExtensions(requestedDeviceExtensions, available);
+				if (!selection.missing.empty())
+				{
+					PublishOptionalDiagnostic(specification, diagnostics, {
+						optionalFeatureName,
+						Walnut::OptionalVulkanFeatureRequirementPhase::DeviceExtensions,
+						Walnut::OptionalVulkanFeatureDisableReason::MissingExtension,
+						selection.missing, VK_SUCCESS,
+						"one or more optional device extensions are unavailable"});
+					optionalRequirements.reset();
+				}
+				else
+				{
+					deviceExtensionStorage = selection.enabled;
+					optionalFeatureEnabled = true;
+				}
+				}
+			}
+		}
 	// Select graphics queue family
 	{
 		uint32_t count;
@@ -243,8 +485,6 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 			"VK_KHR_ray_tracing_maintenance1",
 			"VK_EXT_memory_budget"
 		};
-		int device_extension_count = IM_ARRAYSIZE(device_extensions);
-
 		// Query RT feature support
 		VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features = {};
 		buffer_device_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
@@ -286,6 +526,29 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		bool rt_pipeline_supported = rt_supported &&
 		                              rt_pipeline_features.rayTracingPipeline == VK_TRUE;
 
+		// Copy the existing Walnut requirements first, then append only the
+		// provider names that passed enumeration.  This keeps the baseline device
+		// contract unchanged when no provider is supplied.
+		const std::unordered_set<std::string> optionalDeviceExtensionNames(
+			deviceExtensionStorage.begin(), deviceExtensionStorage.end());
+		deviceExtensionStorage.insert(deviceExtensionStorage.begin(),
+			device_extensions,
+			device_extensions + IM_ARRAYSIZE(device_extensions));
+		{
+			std::vector<std::string> deduplicated;
+			deduplicated.reserve(deviceExtensionStorage.size());
+			std::unordered_set<std::string> seen;
+			for (const std::string& name : deviceExtensionStorage)
+				if (seen.emplace(name).second)
+					deduplicated.emplace_back(name);
+			deviceExtensionStorage = std::move(deduplicated);
+		}
+		std::vector<const char*> deviceExtensionPointers;
+		deviceExtensionPointers.reserve(deviceExtensionStorage.size());
+		for (const std::string& name : deviceExtensionStorage)
+			deviceExtensionPointers.emplace_back(name.c_str());
+		uint32_t device_extension_count = static_cast<uint32_t>(deviceExtensionPointers.size());
+
 		g_RayTracingSupported = rt_supported;
 		g_RayTracingPipelineSupported = rt_pipeline_supported;
 
@@ -314,7 +577,7 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		create_info.queueCreateInfoCount = sizeof(queue_info) / sizeof(queue_info[0]);
 		create_info.pQueueCreateInfos = queue_info;
 		create_info.enabledExtensionCount = device_extension_count;
-		create_info.ppEnabledExtensionNames = device_extensions;
+		create_info.ppEnabledExtensionNames = deviceExtensionPointers.data();
 
 		if (rt_supported)
 		{
@@ -337,8 +600,15 @@ static void SetupVulkan(const char** extensions, uint32_t extensions_count)
 		else
 		{
 			std::cerr << "[RT2] WARNING: Ray Tracing not supported on this device. Falling back to CPU renderer.\n";
-			// Fall back to just swapchain extension
-			create_info.enabledExtensionCount = 1;
+			// Fall back to just swapchain plus any validated optional extensions.
+			deviceExtensionPointers.clear();
+			for (const std::string& name : deviceExtensionStorage)
+				if (name == device_extensions[0] ||
+					(optionalFeatureEnabled && optionalDeviceExtensionNames.find(name) != optionalDeviceExtensionNames.end()))
+					deviceExtensionPointers.emplace_back(name.c_str());
+			device_extension_count = static_cast<uint32_t>(deviceExtensionPointers.size());
+			create_info.enabledExtensionCount = device_extension_count;
+			create_info.ppEnabledExtensionNames = deviceExtensionPointers.data();
 		}
 
 		err = vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_Device);
@@ -606,7 +876,9 @@ namespace Walnut {
 		}
 		uint32_t extensions_count = 0;
 		const char** extensions = glfwGetRequiredInstanceExtensions(&extensions_count);
-		SetupVulkan(extensions, extensions_count);
+		SetupVulkan(m_Specification, m_OptionalVulkanDiagnostics,
+			m_InstanceExtensionStorage, m_DeviceExtensionStorage,
+			m_OptionalVulkanFeatureEnabled, extensions, extensions_count);
 
 		// Create Window Surface
 		VkSurfaceKHR surface;
