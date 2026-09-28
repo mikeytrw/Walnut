@@ -956,6 +956,8 @@ namespace Walnut {
 				if (io.ConfigFlags & ImGuiConfigFlags_DockingEnable)
 				{
 					ImGuiID dockspace_id = ImGui::GetID("VulkanAppDockspace");
+					for (auto& layer : m_LayerStack)
+						layer->OnDockspaceUI((uint32_t)dockspace_id);
 					ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
 				}
 
