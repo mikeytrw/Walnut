@@ -951,6 +951,19 @@ namespace Walnut {
 
 				ImGui::PopStyleVar(2);
 
+				// Menu first so the remaining content rectangle excludes it;
+				// the pre-dock hook (toolbar / pending layouts) runs next and
+				// DockSpace fills what is left. Dock regions reflow once by
+				// the menu height; splits are fractional, so proportions hold.
+				if (m_MenubarCallback)
+				{
+					if (ImGui::BeginMenuBar())
+					{
+						m_MenubarCallback();
+						ImGui::EndMenuBar();
+					}
+				}
+
 				// Submit the DockSpace
 				ImGuiIO& io = ImGui::GetIO();
 				if (io.ConfigFlags & ImGuiConfigFlags_DockingEnable)
@@ -959,15 +972,6 @@ namespace Walnut {
 					for (auto& layer : m_LayerStack)
 						layer->OnDockspaceUI((uint32_t)dockspace_id);
 					ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dockspace_flags);
-				}
-
-				if (m_MenubarCallback)
-				{
-					if (ImGui::BeginMenuBar())
-					{
-						m_MenubarCallback();
-						ImGui::EndMenuBar();
-					}
 				}
 
 				for (auto& layer : m_LayerStack)
