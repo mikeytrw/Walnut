@@ -466,6 +466,12 @@ namespace Walnut {
 		static bool IsRayTracingSupported();
 		static bool IsRayTracingPipelineSupported();
 		static const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& GetRayTracingPipelineProperties();
+		// RT4-T4 shadow-tail diagnostic (dirty-pin change, see commit notes):
+		// true only when VK_KHR_shader_clock was present at device creation
+		// AND shaderDeviceClock was enabled — which happens only when the
+		// host requested the diagnostic via RT2_SHADOW_TAIL_DIAG=1 before
+		// device creation. Ordinary launches are unaffected.
+		static bool IsShaderDeviceClockEnabled();
 		static VkDescriptorPool GetDescriptorPool();
 		const std::vector<OptionalVulkanFeatureDiagnostic>& GetOptionalVulkanDiagnostics() const { return m_OptionalVulkanDiagnostics; }
 		bool IsOptionalVulkanFeatureEnabled() const { return m_OptionalVulkanFeatureEnabled; }

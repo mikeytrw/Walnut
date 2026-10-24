@@ -9,6 +9,7 @@
 #include "RTDispatch.h"
 #include <stdio.h>          // printf, fprintf
 #include <stdlib.h>         // abort
+#include <string.h>         // strcmp (RT4-T4 shader-clock opt-in)
 #define GLFW_INCLUDE_NONE
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -67,6 +68,9 @@ static VkPipelineCache          g_PipelineCache = VK_NULL_HANDLE;
 static VkDescriptorPool         g_DescriptorPool = VK_NULL_HANDLE;
 static bool                     g_RayTracingSupported = false;
 static bool                     g_RayTracingPipelineSupported = false;
+// RT4-T4 shadow-tail diagnostic (dirty-pin change): device-clock state,
+// decided once in CreateLogicalDevice. Ordinary launches keep false.
+static bool                     g_ShaderDeviceClockEnabled = false;
 static VkPhysicalDeviceRayTracingPipelinePropertiesKHR g_RTPipelineProperties = {};
 
 static ImGui_ImplVulkanH_Window g_MainWindowData;
@@ -277,9 +281,15 @@ static VkResult CreateLogicalDevice(
 	VkPhysicalDeviceVulkan11Features vulkan11_features = {};
 	vulkan11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
 	vulkan11_features.pNext = &dynamic_rendering_features;
+	// RT4-T4 shadow-tail diagnostic (dirty-pin change): query only here.
+	// Enabled below if and only if the driver reports support AND the
+	// extension is present; ordinary launches keep prior behavior.
+	VkPhysicalDeviceShaderClockFeaturesKHR shader_clock_features = {};
+	shader_clock_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+	shader_clock_features.pNext = &vulkan11_features;
 	VkPhysicalDeviceFeatures2 device_features2 = {};
 	device_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-	device_features2.pNext = &vulkan11_features;
+	device_features2.pNext = &shader_clock_features;
 	vkGetPhysicalDeviceFeatures2(g_PhysicalDevice, &device_features2);
 	const bool rt_supported = buffer_device_address_features.bufferDeviceAddress == VK_TRUE &&
 		accel_features.accelerationStructure == VK_TRUE && ray_query_features.rayQuery == VK_TRUE;
@@ -303,6 +313,53 @@ static VkResult CreateLogicalDevice(
 	std::vector<const char*> extensionPointers;
 	for (const std::string& name : enabledNames)
 		extensionPointers.emplace_back(name.c_str());
+
+	// RT4-T4 shadow-tail diagnostic (dirty-pin change): opt-in ONLY when
+	// both the extension and the device-clock feature are reported.
+	// Absent support keeps prior behavior exactly (feature stays off).
+	g_ShaderDeviceClockEnabled = false;
+	const bool shaderClockSupported =
+		(shader_clock_features.shaderDeviceClock == VK_TRUE);
+	// Explicitly clear the queried request bit: the chain below is passed
+	// to vkCreateDevice, and a leftover TRUE would request the feature
+	// WITHOUT the extension on ordinary launches (invalid configuration).
+	// It is set true again only on the opt-in path below.
+	shader_clock_features.shaderDeviceClock = VK_FALSE;
+	// RT4-T4 shadow-tail diagnostic (dirty-pin change): genuinely opt-in.
+	// The extension+feature are enabled ONLY when the host requests the
+	// diagnostic BEFORE device creation via RT2_SHADOW_TAIL_DIAG=1. An
+	// ordinary supported launch (variable unset or otherwise) keeps prior
+	// behavior exactly: no clock extension, no feature bit. Requesting a
+	// diagnostic without support fails loud at the request site, never
+	// with silent zeros.
+	bool shadowTailRequested = false;
+	if (const char* envOptIn = getenv("RT2_SHADOW_TAIL_DIAG"))
+		shadowTailRequested = (std::strcmp(envOptIn, "1") == 0);
+	if (shaderClockSupported && shadowTailRequested)
+	{
+		uint32_t extCount = 0;
+		if (vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &extCount, nullptr) == VK_SUCCESS)
+		{
+			std::vector<VkExtensionProperties> extProps(extCount);
+			if (vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &extCount, extProps.data()) == VK_SUCCESS)
+			{
+				for (const auto& prop : extProps)
+				{
+					if (std::strcmp(prop.extensionName, VK_KHR_SHADER_CLOCK_EXTENSION_NAME) == 0)
+					{
+						extensionPointers.emplace_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+						shader_clock_features.shaderDeviceClock = VK_TRUE;
+						g_ShaderDeviceClockEnabled = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+	std::cerr << "[RT2] shader-clock: supported="
+	          << (shaderClockSupported ? "yes" : "no")
+	          << " requested=" << (shadowTailRequested ? "yes" : "no")
+	          << " enabled=" << (g_ShaderDeviceClockEnabled ? "yes" : "no") << ".\n";
 
 	const float queue_priority[] = { 1.0f };
 	VkDeviceQueueCreateInfo queue_info = {};
@@ -1060,6 +1117,12 @@ namespace Walnut {
 	bool Application::IsRayTracingPipelineSupported()
 	{
 		return g_RayTracingPipelineSupported;
+	}
+
+	// RT4-T4 shadow-tail diagnostic (dirty-pin change).
+	bool Application::IsShaderDeviceClockEnabled()
+	{
+		return g_ShaderDeviceClockEnabled;
 	}
 
 	const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& Application::GetRayTracingPipelineProperties()
