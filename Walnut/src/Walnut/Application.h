@@ -421,6 +421,11 @@ namespace Walnut {
 		// feature while baseline Vulkan startup continues.
 		std::function<Result<OptionalVulkanFeatureRequirements>()> optionalVulkanFeatureProvider;
 		OptionalVulkanFeatureDiagnosticSink optionalVulkanFeatureDiagnosticSink;
+		// Optional host font setup, called once before the font atlas is
+		// uploaded, with the main window's content scale (1.0 at 96 DPI).
+		// The host adds its fonts to ImGui::GetIO().Fonts and sets
+		// FontDefault. Unset: Walnut's embedded Roboto at 16 px.
+		std::function<void(float contentScale)> fontLoader;
 	};
 
 	class Application

@@ -835,11 +835,20 @@ namespace Walnut {
 		init_info.CheckVkResultFn = check_vk_result;
 		ImGui_ImplVulkan_Init(&init_info, wd->RenderPass);
 
-		// Load default font
-		ImFontConfig fontConfig;
-		fontConfig.FontDataOwnedByAtlas = false;
-		ImFont* robotoFont = io.Fonts->AddFontFromMemoryTTF((void*)g_RobotoRegular, sizeof(g_RobotoRegular), 16.0f, &fontConfig);
-		io.FontDefault = robotoFont;
+		// Load fonts: the host's loader when supplied, else embedded Roboto.
+		if (m_Specification.fontLoader)
+		{
+			float contentScaleX = 1.0f, contentScaleY = 1.0f;
+			glfwGetWindowContentScale(m_WindowHandle, &contentScaleX, &contentScaleY);
+			m_Specification.fontLoader(contentScaleX > 0.0f ? contentScaleX : 1.0f);
+		}
+		else
+		{
+			ImFontConfig fontConfig;
+			fontConfig.FontDataOwnedByAtlas = false;
+			ImFont* robotoFont = io.Fonts->AddFontFromMemoryTTF((void*)g_RobotoRegular, sizeof(g_RobotoRegular), 16.0f, &fontConfig);
+			io.FontDefault = robotoFont;
+		}
 
 		// Tighten ImGui style for a more compact UI
 		ImGuiStyle& uiStyle = ImGui::GetStyle();
